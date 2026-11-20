@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decryptSecret, encryptSecret, generateInvitationToken, hashToken } from '../../shared/core/crypto.ts';
+import {
+  decryptSecret,
+  encryptSecret,
+  generateInvitationToken,
+  hashToken,
+} from '../../shared/core/crypto.ts';
 import { buildRawMessage } from '../../shared/core/mimeBuilder.ts';
 import { parseRecipient } from '../../shared/core/recipientParser.ts';
 import { assertSendable, renderTemplate } from '../../shared/core/templateRenderer.ts';
@@ -75,18 +80,64 @@ test('recipient parser rejects malformed addresses and CR/LF', () => {
 
 test('template renderer replaces supported placeholders and reports unresolved ones', () => {
   assert.deepEqual(
-    renderTemplate('Hello [Name] at [Company], [Role] [JobId]', {
+    renderTemplate('Hello [Name] at [Company]\n[Role] [JobId]', {
       Name: 'Ari',
       Company: 'Acme',
     }),
     {
-      text: 'Hello Ari at Acme, [Role] [JobId]',
-      unresolved: ['[Role]', '[JobId]'],
+      text: 'Hello Ari at Acme',
+      unresolved: [],
+      warnings: [],
     },
   );
-  assert.throws(() => assertSendable('Hello [Name]', 'Body'), /Unresolved placeholders/);
-  assert.throws(() => assertSendable('Hello', 'Body', ['']), /must not be empty/);
-  assert.throws(() => assertSendable('  ', 'Body'), /Subject is required/);
+  assert.throws(() => assertSendable('Hello [Name]', 'Body'), /These blanks are still empty/);
+  assert.throws(() => assertSendable('Hello', 'Body', ['']), /required blanks/);
+  assert.throws(() => assertSendable('  ', 'Body'), /Add a subject/);
+  assert.throws(() => assertSendable('Hi\nthere', 'Body'), /one line/);
+});
+
+test('optional role and job lines disappear only from messages and extra blank lines collapse', () => {
+  const message =
+    'Hi [Name],\n\nI came across your work at [Company].\n\nRole: [Role]\n\nJob ID: [JobId]\n\n\nThanks';
+  for (const [Role, JobId] of [
+    ['', ''],
+    ['Engineer', ''],
+    ['', '42'],
+    ['Engineer', '42'],
+  ]) {
+    const result = renderTemplate(message, {
+      Name: 'Ari',
+      Company: 'Acme',
+      Role,
+      JobId,
+    });
+    assert.equal(result.text.includes('Role:'), !!Role);
+    assert.equal(result.text.includes('Job ID:'), !!JobId);
+    assert.ok(result.text.includes('I came across your work at Acme.'));
+    assert.equal(result.text.includes('\n\n\n'), false);
+    const subject = renderTemplate('A quick introduction about [Role]', { Role }, 'subject');
+    assert.equal(subject.text, Role ? 'A quick introduction about Engineer' : 'A quick introduction about');
+    assert.equal(subject.warnings.length, Role ? 0 : 1);
+    assertSendable(subject.text, result.text);
+  }
+  for (const name of ['Name', 'Company']) {
+    const result = renderTemplate(`[${name}]`, {});
+    assert.throws(() => assertSendable(result.text, 'Body'), /blanks are still empty/);
+  }
+});
+
+test('mixed required and empty optional blanks retain the sentence with a nonblocking review note', () => {
+  const result = renderTemplate(
+    'I came across your work at [Company] and wanted to share an opportunity for [Role] ([JobId]).',
+    { Company: 'Acme' },
+  );
+  assert.equal(result.text, 'I came across your work at Acme and wanted to share an opportunity for.');
+  assert.deepEqual(result.warnings, [result.text]);
+  assert.deepEqual(result.unresolved, []);
+  assertSendable('Hello', result.text);
+  const literal = '{'.repeat(2) + ' ordinary text ' + '}'.repeat(2);
+  assert.equal(renderTemplate(literal, {}).text, literal);
+  assertSendable(literal, literal);
 });
 
 test('MIME builder rejects header injection in sender, recipient, and subject', () => {
@@ -117,7 +168,10 @@ test('MIME builder encodes non-ASCII subjects using RFC 2047', () => {
 
   assert.match(headers.Subject, /^=\?UTF-8\?B\?.+\?=$/);
   const encodedSubject = headers.Subject.match(/=\?UTF-8\?B\?(.+?)\?=/)?.[1];
-  assert.equal(new TextDecoder().decode(Uint8Array.from(atob(encodedSubject), (c) => c.charCodeAt(0))), 'Café привет');
+  assert.equal(
+    new TextDecoder().decode(Uint8Array.from(atob(encodedSubject), (c) => c.charCodeAt(0))),
+    'Café привет',
+  );
 });
 
 test('MIME attachment is reused as base64 and decodes to the original bytes', () => {
@@ -142,7 +196,11 @@ test('MIME attachment is reused as base64 and decodes to the original bytes', ()
   assert.ok(parts.some((line) => /filename\*=UTF-8''r%C3%A9sum%C3%A9.pdf/.test(line)));
   const base64Start = parts.indexOf('', encodedIndex + 1) + 1;
   const attachmentLines = [];
-  for (let index = base64Start; index < parts.length && !parts[index].startsWith('--reachflow_'); index += 1) {
+  for (
+    let index = base64Start;
+    index < parts.length && !parts[index].startsWith('--reachflow_');
+    index += 1
+  ) {
     if (parts[index]) attachmentLines.push(parts[index]);
   }
   const decoded = atob(attachmentLines.join(''));

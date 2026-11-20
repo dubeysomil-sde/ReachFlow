@@ -8,8 +8,14 @@ const encoder = new TextEncoder();
 
 export interface SessionPayload {
   sub: string;
+  iat: number;
+  firstIat: number;
   exp: number;
 }
+
+const DAY = 86_400;
+const SESSION_LIFETIME = 30 * DAY;
+const ABSOLUTE_LIFETIME = 180 * DAY;
 
 export interface OAuthStatePayload {
   state: string;
@@ -84,15 +90,17 @@ export async function createSessionCookie(
   secret: string,
   secure: boolean,
   now = Date.now(),
+  firstIat = Math.floor(now / 1000),
 ): Promise<string> {
   requireSecret(secret);
-  const payload = base64UrlEncode(
-    encoder.encode(JSON.stringify({ sub: userId, exp: Math.floor(now / 1000) + 60 * 60 * 24 * 7 })),
-  );
+  const iat = Math.floor(now / 1000);
+  const exp = Math.min(iat + SESSION_LIFETIME, firstIat + ABSOLUTE_LIFETIME);
+  if (exp <= iat) throw new Error('Sign in again.');
+  const payload = base64UrlEncode(encoder.encode(JSON.stringify({ sub: userId, iat, firstIat, exp })));
   return serializeCookie(SESSION_COOKIE, `${payload}.${await sign(payload, secret)}`, {
     httpOnly: true,
-    secure,
-    maxAge: 60 * 60 * 24 * 7,
+    secure: true,
+    maxAge: exp - iat,
   });
 }
 
@@ -101,10 +109,11 @@ export async function readSession(
   db: Database,
   secret: string,
   now = Date.now(),
+  renew?: (cookie: string) => void,
 ): Promise<UserRow | null> {
-  requireSecret(secret);
   const value = getCookie(request, SESSION_COOKIE);
   if (!value) return null;
+  requireSecret(secret);
   const separator = value.lastIndexOf('.');
   if (separator <= 0) return null;
   const payload = value.slice(0, separator);
@@ -117,22 +126,42 @@ export async function readSession(
   } catch {
     return null;
   }
-  if (typeof session.sub !== 'string' || session.exp <= Math.floor(now / 1000)) return null;
-  return first<UserRow>(
+  const seconds = Math.floor(now / 1000);
+  if (
+    typeof session.sub !== 'string' ||
+    ![session.exp, session.iat, session.firstIat].every(Number.isSafeInteger) ||
+    session.firstIat > session.iat ||
+    session.iat > seconds ||
+    session.exp <= seconds ||
+    session.exp > session.iat + SESSION_LIFETIME ||
+    session.exp > session.firstIat + ABSOLUTE_LIFETIME ||
+    seconds >= session.firstIat + ABSOLUTE_LIFETIME
+  )
+    return null;
+  const user = await first<UserRow>(
     db,
     `SELECT id, google_id, email, name, profile_picture, role, status, created_at, updated_at
      FROM users WHERE id = ? AND status = 'ACTIVE'`,
     session.sub,
   );
+  if (user && renew && session.exp - seconds < 15 * DAY) {
+    renew(await createSessionCookie(user.id, secret, true, now, session.firstIat));
+  }
+  return user;
 }
 
 export function csrfCookie(value: string, secure: boolean): string {
-  return serializeCookie(CSRF_COOKIE, value, { secure, maxAge: 60 * 60 * 24 * 7 });
+  return serializeCookie(CSRF_COOKIE, value, { secure, maxAge: SESSION_LIFETIME });
+}
+
+export function readCsrfToken(request: Request): string | null {
+  const token = getCookie(request, CSRF_COOKIE);
+  return token && /^[A-Za-z0-9_-]{32}$/.test(token) ? token : null;
 }
 
 export function clearSessionCookies(secure: boolean): string[] {
   return [
-    serializeCookie(SESSION_COOKIE, '', { httpOnly: true, secure, maxAge: 0 }),
+    serializeCookie(SESSION_COOKIE, '', { httpOnly: true, secure: true, maxAge: 0 }),
     serializeCookie(CSRF_COOKIE, '', { secure, maxAge: 0 }),
   ];
 }

@@ -1,4 +1,9 @@
-import { decryptSecret, encryptSecret, generateInvitationToken, hashToken } from '../../../shared/core/crypto.ts';
+import {
+  decryptSecret,
+  encryptSecret,
+  generateInvitationToken,
+  hashToken,
+} from '../../../shared/core/crypto.ts';
 import { buildRawMessage } from '../../../shared/core/mimeBuilder.ts';
 import { parseRecipient } from '../../../shared/core/recipientParser.ts';
 import { assertSendable, renderTemplate } from '../../../shared/core/templateRenderer.ts';
@@ -12,12 +17,19 @@ import {
   createSessionCookie,
   csrfCookie,
   csrfMatches,
+  readCsrfToken,
   readOAuthState,
   readSession,
 } from '../auth/session.ts';
 import { all, first, run, type Database, type PreparedStatement } from '../db/database.ts';
-import type { CampaignRecipientRow, CampaignRow, ConnectedEmailAccountRow, EmailTemplateRow, UserRow } from '../db/types.ts';
-import type { GoogleClient } from '../google/googleClient.ts';
+import type {
+  CampaignRecipientRow,
+  CampaignRow,
+  ConnectedEmailAccountRow,
+  EmailTemplateRow,
+  UserRow,
+} from '../db/types.ts';
+import { GoogleAccessExpiredError, isInvalidGoogleToken, type GoogleClient } from '../google/googleClient.ts';
 
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
@@ -28,30 +40,26 @@ const JSON_HEADERS = {
   'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
 };
 const MAX_BODY_CHARS = 2_250_000;
-const MAX_CAMPAIGN_RECIPIENTS = 49;
+const MAX_CAMPAIGN_RECIPIENTS = 45;
 const MAX_SEND_BATCH = 8;
 const MAX_RESUME_BYTES = 1_572_864;
 const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
 const LOGIN_SCOPES = ['openid', 'email', 'profile'];
-const GMAIL_SCOPES = [
-  ...LOGIN_SCOPES,
-  'https://www.googleapis.com/auth/gmail.send',
-];
+const GMAIL_SCOPES = [...LOGIN_SCOPES, 'https://www.googleapis.com/auth/gmail.send'];
+const GMAIL_EXPIRED = 'Gmail access has expired. Reconnect Gmail, then continue.';
 
 export interface ApiDependencies {
   db: Database;
   google: GoogleClient;
   config: AppConfig;
   now?: () => number;
+  sessionUser?: UserRow | null;
 }
 
 class ApiError extends Error {
   readonly status: number;
 
-  constructor(
-    status: number,
-    message: string,
-  ) {
+  constructor(status: number, message: string) {
     super(message);
     this.status = status;
   }
@@ -78,7 +86,10 @@ interface CampaignRecipientInput {
 function json(data: unknown, status = 200, headers?: HeadersInit): Response {
   const responseHeaders = new Headers(JSON_HEADERS);
   if (headers) new Headers(headers).forEach((value, key) => responseHeaders.append(key, value));
-  return new Response(JSON.stringify(data), { status, headers: responseHeaders });
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: responseHeaders,
+  });
 }
 
 function redirect(location: string, cookies: string[] = []): Response {
@@ -101,12 +112,12 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   try {
     const body: unknown = JSON.parse(text);
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      throw new ApiError(400, 'Invalid request body');
+      throw new ApiError(400, 'Check the form and try again.');
     }
     return body as Record<string, unknown>;
   } catch (error) {
     if (error instanceof ApiError) throw error;
-    throw new ApiError(400, 'Invalid JSON body');
+    throw new ApiError(400, 'Check the form and try again.');
   }
 }
 
@@ -150,34 +161,26 @@ function makeErrorRedirect(config: AppConfig, code: string): string {
 function ensureSameOrigin(request: Request, config: AppConfig): void {
   const origin = request.headers.get('Origin');
   if (!origin || origin !== new URL(config.appBaseUrl).origin) {
-    throw new ApiError(403, 'Request origin is not allowed');
+    throw new ApiError(403, 'Open ReachFlow directly and try again.');
   }
-  if (!csrfMatches(request)) throw new ApiError(403, 'CSRF validation failed');
+  if (!csrfMatches(request)) throw new ApiError(403, 'Reload the page and try again.');
 }
 
-async function requireUser(
-  request: Request,
-  dependencies: ApiDependencies,
-): Promise<UserRow> {
-  const user = await readSession(
-    request,
-    dependencies.db,
-    dependencies.config.sessionSecret,
-    getNow(dependencies),
-  );
+async function requireUser(request: Request, dependencies: ApiDependencies): Promise<UserRow> {
+  const user = dependencies.sessionUser;
   if (!user) throw new ApiError(401, 'Sign-in required');
   return user;
 }
 
 function requireAdmin(user: UserRow): void {
-  if (user.role !== 'ADMIN') throw new ApiError(403, 'Administrator access required');
+  if (user.role !== 'ADMIN') throw new ApiError(403, 'Only admins can do this.');
 }
 
 function parseTemplate(body: Record<string, unknown>): TemplatePayload {
   return {
-    template_name: stringValue(body.template_name, 'template name', 120).trim(),
+    template_name: stringValue(body.template_name, 'message name', 120).trim(),
     default_subject: stringValue(body.default_subject, 'subject', 998),
-    default_body: stringValue(body.default_body, 'body', 100_000),
+    default_body: stringValue(body.default_body, 'message', 100_000),
   };
 }
 
@@ -185,44 +188,69 @@ function validateRecipientInput(
   input: CampaignRecipientInput,
   defaultSubject: string,
   defaultBody: string,
-): Omit<CampaignRecipientRow, 'id' | 'campaign_id' | 'sending_status' | 'attempt_count' | 'gmail_message_id' | 'error_message' | 'sent_at' | 'created_at' | 'updated_at'> {
-  if (!input || typeof input !== 'object') throw new ApiError(400, 'Invalid recipient');
+): Omit<
+  CampaignRecipientRow,
+  | 'id'
+  | 'campaign_id'
+  | 'sending_status'
+  | 'attempt_count'
+  | 'gmail_message_id'
+  | 'error_message'
+  | 'sent_at'
+  | 'created_at'
+  | 'updated_at'
+> {
+  if (!input || typeof input !== 'object') throw new ApiError(400, 'Check the receiver details.');
   let parsed: ReturnType<typeof parseRecipient>;
   try {
-    parsed = parseRecipient(stringValue(input.email, 'recipient email', 254));
+    parsed = parseRecipient(stringValue(input.email, 'email address', 254));
   } catch {
-    throw new ApiError(400, 'Invalid recipient email');
+    throw new ApiError(400, 'Check the email address.');
   }
   if (input.use_custom_subject !== undefined && typeof input.use_custom_subject !== 'boolean') {
-    throw new ApiError(400, 'Invalid custom subject flag');
+    throw new ApiError(400, 'Check the subject.');
   }
   const recipientName = typeof input.recipient_name === 'string' ? input.recipient_name : parsed.firstName;
-  const recipientCompany = typeof input.recipient_company === 'string' ? input.recipient_company : parsed.company;
+  const recipientCompany =
+    typeof input.recipient_company === 'string' ? input.recipient_company : parsed.company;
   const recipientRole = typeof input.recipient_role === 'string' ? input.recipient_role : '';
   const recipientJobId = typeof input.recipient_job_id === 'string' ? input.recipient_job_id : '';
-  for (const [field, value] of [['name', recipientName], ['company', recipientCompany], ['role', recipientRole], ['job id', recipientJobId]] as const) {
-    if (value.length > 500) throw new ApiError(400, `Invalid recipient ${field}`);
+  if (!recipientName.trim()) throw new ApiError(400, 'Fill in the name');
+  if (!recipientCompany.trim()) throw new ApiError(400, 'Fill in the company');
+  for (const [field, value] of [
+    ['name', recipientName],
+    ['company', recipientCompany],
+    ['role', recipientRole],
+    ['job id', recipientJobId],
+  ] as const) {
+    if (value.length > 500) throw new ApiError(400, `The ${field} is too long.`);
   }
   const useCustomSubject = input.use_custom_subject === true;
   const customSubject = typeof input.custom_subject === 'string' ? input.custom_subject : null;
-  const finalSubject = typeof input.final_subject === 'string'
-    ? input.final_subject
-    : useCustomSubject && customSubject !== null
-      ? customSubject
-      : renderTemplate(defaultSubject, {
+  const finalSubject =
+    typeof input.final_subject === 'string'
+      ? input.final_subject
+      : useCustomSubject && customSubject !== null
+        ? customSubject
+        : renderTemplate(
+            defaultSubject,
+            {
+              Name: recipientName,
+              Company: recipientCompany,
+              Role: recipientRole,
+              JobId: recipientJobId,
+            },
+            'subject',
+          ).text;
+  const finalBody =
+    typeof input.final_body === 'string'
+      ? input.final_body
+      : renderTemplate(defaultBody, {
           Name: recipientName,
           Company: recipientCompany,
           Role: recipientRole,
           JobId: recipientJobId,
         }).text;
-  const finalBody = typeof input.final_body === 'string'
-    ? input.final_body
-    : renderTemplate(defaultBody, {
-        Name: recipientName,
-        Company: recipientCompany,
-        Role: recipientRole,
-        JobId: recipientJobId,
-      }).text;
 
   assertNoHeaderBreaks(finalSubject, 'subject');
   if (finalSubject.length > 998 || finalBody.length > 100_000) {
@@ -230,8 +258,8 @@ function validateRecipientInput(
   }
   try {
     assertSendable(finalSubject, finalBody);
-  } catch {
-    throw new ApiError(400, 'Subject or body contains unresolved placeholders');
+  } catch (reason) {
+    throw new ApiError(400, reason instanceof Error ? reason.message : 'Fill in the empty blanks.');
   }
   return {
     recipient_email: parsed.email,
@@ -262,7 +290,7 @@ function validateResume(input: unknown): { filename: string; base64: string } | 
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 === 1) {
     throw new ApiError(400, 'Invalid resume data');
   }
-  const bytesLength = Math.floor(normalized.replace(/=+$/, '').length * 3 / 4);
+  const bytesLength = Math.floor((normalized.replace(/=+$/, '').length * 3) / 4);
   if (bytesLength > MAX_RESUME_BYTES) throw new ApiError(413, 'Resume exceeds 1.5 MB');
   let decoded: string;
   try {
@@ -274,10 +302,7 @@ function validateResume(input: unknown): { filename: string; base64: string } | 
   return { filename, base64: normalized };
 }
 
-async function beginGoogleLogin(
-  request: Request,
-  dependencies: ApiDependencies,
-): Promise<Response> {
+async function beginGoogleLogin(request: Request, dependencies: ApiDependencies): Promise<Response> {
   const url = new URL(request.url);
   const invite = url.searchParams.get('invite');
   let inviteHash: string | undefined;
@@ -304,10 +329,7 @@ async function beginGoogleLogin(
   ]);
 }
 
-async function completeGoogleLogin(
-  request: Request,
-  dependencies: ApiDependencies,
-): Promise<Response> {
+async function completeGoogleLogin(request: Request, dependencies: ApiDependencies): Promise<Response> {
   const url = new URL(request.url);
   if (url.searchParams.has('error')) {
     return redirect(makeErrorRedirect(dependencies.config, 'google_sign_in_failed'), [
@@ -317,7 +339,13 @@ async function completeGoogleLogin(
   const code = url.searchParams.get('code');
   const stateValue = url.searchParams.get('state');
   const oauthState = await readOAuthState(request, dependencies.config.sessionSecret, getNow(dependencies));
-  if (!code || !stateValue || !oauthState || oauthState.purpose !== 'LOGIN' || oauthState.state !== stateValue) {
+  if (
+    !code ||
+    !stateValue ||
+    !oauthState ||
+    oauthState.purpose !== 'LOGIN' ||
+    oauthState.state !== stateValue
+  ) {
     return redirect(makeErrorRedirect(dependencies.config, 'invalid_oauth_state'), [
       clearOAuthCookie(isSecure(dependencies.config)),
     ]);
@@ -344,15 +372,16 @@ async function completeGoogleLogin(
         'SELECT id FROM users WHERE email = ?',
         googleUser.email,
       );
-      if (emailOwner) return redirect(makeErrorRedirect(dependencies.config, 'account_conflict'), [
-        clearOAuthCookie(isSecure(dependencies.config)),
-      ]);
+      if (emailOwner)
+        return redirect(makeErrorRedirect(dependencies.config, 'account_conflict'), [
+          clearOAuthCookie(isSecure(dependencies.config)),
+        ]);
 
       const registration = await first<{ value: string }>(
         dependencies.db,
         `SELECT value FROM app_settings WHERE key = 'registration_mode'`,
       );
-      if (registration?.value !== 'PUBLIC') {
+      if (registration?.value !== 'PUBLIC' && !dependencies.config.adminEmails.has(googleUser.email)) {
         if (!oauthState.inviteHash) {
           return redirect(makeErrorRedirect(dependencies.config, 'invitation_required'), [
             clearOAuthCookie(isSecure(dependencies.config)),
@@ -408,7 +437,12 @@ async function completeGoogleLogin(
 
     const csrf = createRandomToken(24);
     return redirect(dependencies.config.appBaseUrl, [
-      await createSessionCookie(user.id, dependencies.config.sessionSecret, isSecure(dependencies.config), getNow(dependencies)),
+      await createSessionCookie(
+        user.id,
+        dependencies.config.sessionSecret,
+        isSecure(dependencies.config),
+        getNow(dependencies),
+      ),
       csrfCookie(csrf, isSecure(dependencies.config)),
       clearOAuthCookie(isSecure(dependencies.config)),
     ]);
@@ -450,10 +484,7 @@ async function beginGmailConnect(
   return redirect(location, [cookie]);
 }
 
-async function completeGmailConnect(
-  request: Request,
-  dependencies: ApiDependencies,
-): Promise<Response> {
+async function completeGmailConnect(request: Request, dependencies: ApiDependencies): Promise<Response> {
   const url = new URL(request.url);
   const user = await requireUser(request, dependencies);
   const oauthState = await readOAuthState(request, dependencies.config.sessionSecret, getNow(dependencies));
@@ -475,7 +506,11 @@ async function completeGmailConnect(
       redirectUri(dependencies.config, '/api/auth/gmail/callback'),
       oauthState.verifier,
     );
-    if (!tokens.refreshToken) throw new Error('Google did not return a refresh token');
+    if (!tokens.refreshToken?.trim()) {
+      return redirect(makeErrorRedirect(dependencies.config, 'gmail_refresh_token_missing'), [
+        clearOAuthCookie(isSecure(dependencies.config)),
+      ]);
+    }
     const googleUser = await dependencies.google.userInfo(tokens.accessToken);
     const encrypted = await encryptSecret(tokens.refreshToken, dependencies.config.tokenEncryptionKey);
     const timestamp = isoNow(dependencies);
@@ -510,11 +545,16 @@ async function completeGmailConnect(
   }
 }
 
-async function handleAuth(
-  request: Request,
-  path: string,
-  dependencies: ApiDependencies,
-): Promise<Response> {
+async function handleAuth(request: Request, path: string, dependencies: ApiDependencies): Promise<Response> {
+  if (request.method === 'DELETE' && path === '/api/auth/account') {
+    const user = await requireUser(request, dependencies);
+    const body = await readJson(request);
+    if (body.confirmation !== 'DELETE') throw new ApiError(400, 'Type DELETE to remove your account.');
+    await deleteUserData(user.id, dependencies);
+    const response = json({ ok: true });
+    for (const cookie of clearSessionCookies(true)) response.headers.append('Set-Cookie', cookie);
+    return response;
+  }
   if (request.method === 'GET' && path === '/api/auth/google/start') {
     return beginGoogleLogin(request, dependencies);
   }
@@ -522,19 +562,17 @@ async function handleAuth(
     return completeGoogleLogin(request, dependencies);
   }
   if (request.method === 'GET' && path === '/api/auth/csrf') {
-    const token = createRandomToken(24);
+    const token = readCsrfToken(request) ?? createRandomToken(24);
     return json({ csrfToken: token }, 200, {
       'Set-Cookie': csrfCookie(token, isSecure(dependencies.config)),
     });
   }
   if (request.method === 'GET' && path === '/api/auth/me') {
-    const user = await readSession(
-      request,
-      dependencies.db,
-      dependencies.config.sessionSecret,
-      getNow(dependencies),
-    );
-    return json({ user: user ? publicUser(user) : null, emailMode: dependencies.config.emailMode });
+    const user = dependencies.sessionUser;
+    return json({
+      user: user ? publicUser(user) : null,
+      emailMode: dependencies.config.emailMode,
+    });
   }
   if (request.method === 'POST' && path === '/api/auth/logout') {
     const response = json({ ok: true });
@@ -546,7 +584,7 @@ async function handleAuth(
   if (request.method === 'GET' && path === '/api/auth/gmail/connect') {
     const user = await requireUser(request, dependencies);
     if (!dependencies.config.googleClientId || !dependencies.config.googleClientSecret) {
-      throw new ApiError(503, 'Google OAuth is not configured');
+      throw new ApiError(503, 'Google sign-in is not ready.');
     }
     return beginGmailConnect(request, user, dependencies);
   }
@@ -555,7 +593,9 @@ async function handleAuth(
   }
   if (request.method === 'GET' && path === '/api/auth/gmail') {
     const user = await requireUser(request, dependencies);
-    const accounts = await all<Pick<ConnectedEmailAccountRow, 'id' | 'email_address' | 'connection_status' | 'created_at'>>(
+    const accounts = await all<
+      Pick<ConnectedEmailAccountRow, 'id' | 'email_address' | 'connection_status' | 'created_at'>
+    >(
       dependencies.db,
       `SELECT id, email_address, connection_status, created_at
        FROM connected_email_accounts WHERE user_id = ? ORDER BY created_at`,
@@ -583,7 +623,7 @@ async function handleAuth(
       },
       dependencies.config.tokenEncryptionKey,
     );
-    await dependencies.google.revokeToken(refreshToken);
+    await revokeIfNeeded(refreshToken, dependencies);
     await run(
       dependencies.db,
       `UPDATE connected_email_accounts
@@ -607,6 +647,61 @@ function publicUser(user: UserRow): Pick<UserRow, 'id' | 'email' | 'name' | 'pro
   };
 }
 
+async function deleteUserData(userId: string, dependencies: ApiDependencies): Promise<void> {
+  // Disable first so a new batch cannot race token revocation and deletion.
+  const locked = await run(
+    dependencies.db,
+    `UPDATE users SET status = 'DISABLED'
+    WHERE id = ? AND NOT EXISTS (
+      SELECT 1 FROM campaigns c WHERE c.user_id = users.id AND
+      (c.status = 'SENDING' OR EXISTS (
+        SELECT 1 FROM campaign_recipients r WHERE r.campaign_id = c.id AND r.sending_status = 'PROCESSING'
+      )))`,
+    userId,
+  );
+  if (!locked) throw new ApiError(409, 'Stop it first');
+  const accounts = await all<ConnectedEmailAccountRow>(
+    dependencies.db,
+    `SELECT * FROM connected_email_accounts WHERE user_id = ? AND connection_status <> 'REVOKED'`,
+    userId,
+  );
+  try {
+    for (const account of accounts) {
+      const token = await decryptSecret(
+        {
+          ciphertext: account.encrypted_refresh_token,
+          iv: account.token_iv,
+          keyVersion: account.key_version,
+        },
+        dependencies.config.tokenEncryptionKey,
+      );
+      await revokeIfNeeded(token, dependencies);
+      await run(
+        dependencies.db,
+        `UPDATE connected_email_accounts SET connection_status = 'REVOKED' WHERE id = ?`,
+        account.id,
+      );
+    }
+  } catch {
+    throw new ApiError(
+      502,
+      'Gmail could not be disconnected. Your account is disabled. Ask an admin to finish deleting it.',
+    );
+  }
+  await dependencies.db.batch([
+    dependencies.db.prepare('DELETE FROM invitations WHERE invited_by = ?').bind(userId),
+    dependencies.db.prepare('DELETE FROM users WHERE id = ?').bind(userId),
+  ]);
+}
+
+async function revokeIfNeeded(token: string, dependencies: ApiDependencies): Promise<void> {
+  try {
+    await dependencies.google.revokeToken(token);
+  } catch (reason) {
+    if (!isInvalidGoogleToken(reason)) throw reason;
+  }
+}
+
 async function handleAdmin(
   request: Request,
   path: string,
@@ -614,12 +709,36 @@ async function handleAdmin(
   dependencies: ApiDependencies,
 ): Promise<Response> {
   requireAdmin(user);
+  const inviteDelete = path.match(/^\/api\/admin\/invitations\/([^/]+)$/);
+  if (request.method === 'DELETE' && inviteDelete) {
+    const changes = await run(
+      dependencies.db,
+      'DELETE FROM invitations WHERE id = ?',
+      decodeURIComponent(inviteDelete[1]),
+    );
+    if (!changes) throw new ApiError(404, 'Invite not found.');
+    return json({ ok: true });
+  }
+  const userDelete = path.match(/^\/api\/admin\/users\/([^/]+)$/);
+  if (request.method === 'DELETE' && userDelete) {
+    const id = decodeURIComponent(userDelete[1]);
+    if (id === user.id) throw new ApiError(403, 'You cannot remove your own admin account here.');
+    if (!(await first(dependencies.db, 'SELECT id FROM users WHERE id = ?', id))) {
+      throw new ApiError(404, 'User not found.');
+    }
+    await deleteUserData(id, dependencies);
+    return json({ ok: true });
+  }
   if (request.method === 'GET' && path === '/api/admin/settings') {
     const setting = await first<{ value: string }>(
       dependencies.db,
       `SELECT value FROM app_settings WHERE key = 'registration_mode'`,
     );
-    const counts = await first<{ users: number; campaigns: number; invitations: number }>(
+    const counts = await first<{
+      users: number;
+      campaigns: number;
+      invitations: number;
+    }>(
       dependencies.db,
       `SELECT
         (SELECT COUNT(*) FROM users) AS users,
@@ -631,7 +750,7 @@ async function handleAdmin(
   if (request.method === 'POST' && path === '/api/admin/registration-mode') {
     const body = await readJson(request);
     const mode = stringValue(body.mode, 'registration mode', 20);
-    if (mode !== 'INVITE_ONLY' && mode !== 'PUBLIC') throw new ApiError(400, 'Invalid registration mode');
+    if (mode !== 'INVITE_ONLY' && mode !== 'PUBLIC') throw new ApiError(400, 'Choose who can join.');
     await run(
       dependencies.db,
       `INSERT INTO app_settings (key, value, updated_at)
@@ -652,7 +771,7 @@ async function handleAdmin(
     }
     const lifetimeDays = body.lifetimeDays === undefined ? 7 : Number(body.lifetimeDays);
     if (!Number.isInteger(lifetimeDays) || lifetimeDays < 1 || lifetimeDays > 30) {
-      throw new ApiError(400, 'Invitation lifetime must be 1 to 30 days');
+      throw new ApiError(400, 'An invite must last 1 to 30 days.');
     }
     const token = generateInvitationToken();
     const tokenHash = await hashToken(token);
@@ -668,14 +787,17 @@ async function handleAdmin(
       user.id,
       expiresAt,
     );
-    return json({
-      invitation: {
-        id,
-        email,
-        expiresAt,
-        link: `${dependencies.config.appBaseUrl}/?invite=${encodeURIComponent(token)}`,
+    return json(
+      {
+        invitation: {
+          id,
+          email,
+          expiresAt,
+          link: `${dependencies.config.appBaseUrl}/?invite=${encodeURIComponent(token)}`,
+        },
       },
-    }, 201);
+      201,
+    );
   }
   if (request.method === 'GET' && path === '/api/admin/invitations') {
     const invitations = await all(
@@ -728,7 +850,7 @@ async function handleTemplates(
   if (path === '/api/templates' && request.method === 'POST') {
     const body = await readJson(request);
     const template = parseTemplate(body);
-    if (!template.template_name) throw new ApiError(400, 'Template name is required');
+    if (!template.template_name) throw new ApiError(400, 'Add a message name.');
     const id = randomId();
     const now = isoNow(dependencies);
     await run(
@@ -744,7 +866,18 @@ async function handleTemplates(
       now,
       now,
     );
-    return json({ template: { id, user_id: user.id, ...template, created_at: now, updated_at: now } }, 201);
+    return json(
+      {
+        template: {
+          id,
+          user_id: user.id,
+          ...template,
+          created_at: now,
+          updated_at: now,
+        },
+      },
+      201,
+    );
   }
   const match = path.match(/^\/api\/templates\/([^/]+)$/);
   if (!match) throw new ApiError(404, 'Route not found');
@@ -764,7 +897,7 @@ async function handleTemplates(
       id,
       user.id,
     );
-    if (!changes) throw new ApiError(404, 'Template not found');
+    if (!changes) throw new ApiError(404, 'Message not found.');
     return json({ ok: true });
   }
   if (request.method === 'DELETE') {
@@ -774,7 +907,7 @@ async function handleTemplates(
       id,
       user.id,
     );
-    if (!changes) throw new ApiError(404, 'Template not found');
+    if (!changes) throw new ApiError(404, 'Message not found.');
     return json({ ok: true });
   }
   throw new ApiError(405, 'Method not allowed');
@@ -785,12 +918,7 @@ async function getOwnedCampaign(
   campaignId: string,
   userId: string,
 ): Promise<CampaignRow | null> {
-  return first<CampaignRow>(
-    db,
-    'SELECT * FROM campaigns WHERE id = ? AND user_id = ?',
-    campaignId,
-    userId,
-  );
+  return first<CampaignRow>(db, 'SELECT * FROM campaigns WHERE id = ? AND user_id = ?', campaignId, userId);
 }
 
 async function handleCampaigns(
@@ -799,6 +927,42 @@ async function handleCampaigns(
   user: UserRow,
   dependencies: ApiDependencies,
 ): Promise<Response> {
+  if (path === '/api/campaigns/contact-history' && request.method === 'POST') {
+    const body = await readJson(request);
+    if (
+      !Array.isArray(body.emails) ||
+      body.emails.length > 45 ||
+      body.emails.some((email) => typeof email !== 'string' || email.length > 254)
+    ) {
+      throw new ApiError(400, 'Check the email list.');
+    }
+    if (!body.emails.length) return json({ contacts: [] });
+    const contacts = await all(
+      dependencies.db,
+      `SELECT r.recipient_email AS email, MAX(r.sent_at) AS sent_at
+      FROM campaign_recipients r JOIN campaigns c ON c.id = r.campaign_id
+      WHERE c.user_id = ? AND r.sending_status = 'SENT'
+      AND r.recipient_email IN (${body.emails.map(() => '?').join(',')})
+      GROUP BY r.recipient_email`,
+      user.id,
+      ...body.emails,
+    );
+    return json({ contacts });
+  }
+  if (path === '/api/campaigns' && request.method === 'DELETE') {
+    const body = await readJson(request);
+    if (
+      body.all !== true &&
+      (!Array.isArray(body.ids) ||
+        !body.ids.length ||
+        body.ids.length > 45 ||
+        body.ids.some((id) => typeof id !== 'string'))
+    ) {
+      throw new ApiError(400, 'Select the History items to delete.');
+    }
+    const ids = body.all === true ? [] : (body.ids as string[]);
+    return deleteHistory(user.id, ids, body.all === true, dependencies);
+  }
   if (path === '/api/campaigns' && request.method === 'GET') {
     const campaigns = await all<CampaignRow>(
       dependencies.db,
@@ -809,14 +973,19 @@ async function handleCampaigns(
   }
   if (path === '/api/campaigns' && request.method === 'POST') {
     const body = await readJson(request);
-    const campaignName = stringValue(body.campaign_name, 'campaign name', 160).trim();
-    if (!campaignName) throw new ApiError(400, 'Campaign name is required');
-    if (!Array.isArray(body.recipients) || body.recipients.length < 1 || body.recipients.length > MAX_CAMPAIGN_RECIPIENTS) {
-      throw new ApiError(400, `Campaigns must contain 1 to ${MAX_CAMPAIGN_RECIPIENTS} recipients`);
+    const campaignName = stringValue(body.campaign_name, 'send name', 160).trim();
+    if (!campaignName) throw new ApiError(400, 'Add a send name.');
+    if (
+      !Array.isArray(body.recipients) ||
+      body.recipients.length < 1 ||
+      body.recipients.length > MAX_CAMPAIGN_RECIPIENTS
+    ) {
+      throw new ApiError(400, `Add 1 to ${MAX_CAMPAIGN_RECIPIENTS} receivers to a send.`);
     }
-    const templateId = body.template_id === null || body.template_id === undefined
-      ? null
-      : stringValue(body.template_id, 'template id', 100);
+    const templateId =
+      body.template_id === null || body.template_id === undefined
+        ? null
+        : stringValue(body.template_id, 'message id', 100);
     let template: EmailTemplateRow | null = null;
     if (templateId) {
       template = await first<EmailTemplateRow>(
@@ -825,58 +994,71 @@ async function handleCampaigns(
         templateId,
         user.id,
       );
-      if (!template) throw new ApiError(404, 'Template not found');
+      if (!template) throw new ApiError(404, 'Message not found.');
     }
-    const defaultSubject = stringValue(
-      template?.default_subject ?? body.default_subject,
-      'subject',
-      998,
-    );
-    const defaultBody = stringValue(
-      template?.default_body ?? body.default_body,
-      'body',
-      100_000,
-    );
-    const recipients = body.recipients.map((recipient) =>
-      validateRecipientInput(recipient as CampaignRecipientInput, defaultSubject, defaultBody),
-    );
+    const defaultSubject = stringValue(template?.default_subject ?? body.default_subject, 'subject', 998);
+    const defaultBody = stringValue(template?.default_body ?? body.default_body, 'message', 100_000);
+    let recipients;
+    try {
+      recipients = body.recipients.map((recipient) =>
+        validateRecipientInput(recipient as CampaignRecipientInput, defaultSubject, defaultBody),
+      );
+    } catch (reason) {
+      if (reason instanceof ApiError) throw reason;
+      throw new ApiError(400, 'Check the empty blanks in your message.');
+    }
     if (new Set(recipients.map((recipient) => recipient.recipient_email)).size !== recipients.length) {
-      throw new ApiError(400, 'Duplicate recipient email');
+      throw new ApiError(400, 'An email address is listed twice.');
     }
     const id = randomId();
     const now = isoNow(dependencies);
     const statements: PreparedStatement[] = [
-      dependencies.db.prepare(
-        `INSERT INTO campaigns
+      dependencies.db
+        .prepare(
+          `INSERT INTO campaigns
           (id, user_id, template_id, campaign_name, total_recipients, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
-      ).bind(id, user.id, templateId, campaignName, recipients.length, now),
+        )
+        .bind(id, user.id, templateId, campaignName, recipients.length, now),
       ...recipients.map((recipient) =>
-        dependencies.db.prepare(
-          `INSERT INTO campaign_recipients
+        dependencies.db
+          .prepare(
+            `INSERT INTO campaign_recipients
             (id, campaign_id, recipient_email, recipient_name, recipient_company,
              recipient_role, recipient_job_id, use_custom_subject, custom_subject,
              final_subject, final_body, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(
-          randomId(),
-          id,
-          recipient.recipient_email,
-          recipient.recipient_name,
-          recipient.recipient_company,
-          recipient.recipient_role,
-          recipient.recipient_job_id,
-          recipient.use_custom_subject,
-          recipient.custom_subject,
-          recipient.final_subject,
-          recipient.final_body,
-          now,
-          now,
-        ),
+          )
+          .bind(
+            randomId(),
+            id,
+            recipient.recipient_email,
+            recipient.recipient_name,
+            recipient.recipient_company,
+            recipient.recipient_role,
+            recipient.recipient_job_id,
+            recipient.use_custom_subject,
+            recipient.custom_subject,
+            recipient.final_subject,
+            recipient.final_body,
+            now,
+            now,
+          ),
       ),
     ];
     await dependencies.db.batch(statements);
-    return json({ campaign: { id, user_id: user.id, campaign_name: campaignName, status: 'DRAFT', total_recipients: recipients.length } }, 201);
+    return json(
+      {
+        campaign: {
+          id,
+          user_id: user.id,
+          campaign_name: campaignName,
+          status: 'DRAFT',
+          total_recipients: recipients.length,
+        },
+      },
+      201,
+    );
   }
 
   const match = path.match(/^\/api\/campaigns\/([^/]+)(?:\/(send-batch|cancel|retry-failed))?$/);
@@ -884,7 +1066,10 @@ async function handleCampaigns(
   const campaignId = decodeURIComponent(match[1]);
   const action = match[2];
   const campaign = await getOwnedCampaign(dependencies.db, campaignId, user.id);
-  if (!campaign) throw new ApiError(404, 'Campaign not found');
+  if (!campaign) throw new ApiError(404, 'Send not found.');
+  if (!action && request.method === 'DELETE') {
+    return deleteHistory(user.id, [campaignId], false, dependencies);
+  }
 
   if (!action && request.method === 'GET') {
     const recipients = await all<CampaignRecipientRow>(
@@ -894,7 +1079,62 @@ async function handleCampaigns(
     );
     return json({ campaign, recipients });
   }
+
+  async function deleteHistory(
+    userId: string,
+    ids: string[],
+    allHistory: boolean,
+    dependencies: ApiDependencies,
+  ): Promise<Response> {
+    const scope = allHistory ? '' : ` AND id IN (${ids.map(() => '?').join(',')})`;
+    const values = [userId, ...ids];
+    if (!allHistory) {
+      const owned = await first<{ count: number }>(
+        dependencies.db,
+        `SELECT COUNT(*) AS count FROM campaigns WHERE user_id = ?${scope}`,
+        ...values,
+      );
+      if (owned?.count !== new Set(ids).size) throw new ApiError(404, 'History item not found.');
+    }
+    const busy = `status = 'SENDING' OR EXISTS (SELECT 1 FROM campaign_recipients r
+      WHERE r.campaign_id = campaigns.id AND r.sending_status = 'PROCESSING')`;
+    const blocked = await first(
+      dependencies.db,
+      `SELECT id FROM campaigns WHERE user_id = ?${scope} AND (${busy}) LIMIT 1`,
+      ...values,
+    );
+    if (blocked) throw new ApiError(409, 'Stop it first');
+    // One statement prevents partial deletion if a send starts after the pre-check.
+    const changes = await run(
+      dependencies.db,
+      `DELETE FROM campaigns WHERE user_id = ?${scope}
+      AND NOT EXISTS (SELECT 1 FROM campaigns c WHERE c.user_id = ?
+        ${allHistory ? '' : `AND c.id IN (${ids.map(() => '?').join(',')})`}
+        AND (c.status = 'SENDING' OR EXISTS (SELECT 1 FROM campaign_recipients r
+          WHERE r.campaign_id = c.id AND r.sending_status = 'PROCESSING')))`,
+      ...values,
+      ...values,
+    );
+    if (!changes && (allHistory || ids.length)) {
+      const stillBusy = await first(
+        dependencies.db,
+        `SELECT id FROM campaigns WHERE user_id = ?${scope} AND (${busy}) LIMIT 1`,
+        ...values,
+      );
+      if (stillBusy) throw new ApiError(409, 'Stop it first');
+    }
+    return json({ deleted: changes });
+  }
   if (action === 'cancel' && request.method === 'POST') {
+    await run(
+      dependencies.db,
+      `UPDATE campaign_recipients SET sending_status = 'UNKNOWN',
+      error_message = 'Not sure - please check your Gmail Sent folder', updated_at = ?
+      WHERE campaign_id = ? AND sending_status = 'PROCESSING' AND updated_at < ?`,
+      isoNow(dependencies),
+      campaignId,
+      new Date(getNow(dependencies) - PROCESSING_TIMEOUT_MS).toISOString(),
+    );
     await run(
       dependencies.db,
       `UPDATE campaign_recipients SET sending_status = 'CANCELLED', updated_at = ?
@@ -969,66 +1209,72 @@ async function sendCampaignBatch(
   await run(
     dependencies.db,
     `UPDATE campaign_recipients
-     SET sending_status = 'UNKNOWN', error_message = 'Delivery outcome could not be confirmed', updated_at = ?
+     SET sending_status = 'UNKNOWN', error_message = 'Not sure - please check your Gmail Sent folder', updated_at = ?
      WHERE campaign_id = ? AND sending_status = 'PROCESSING' AND updated_at < ?`,
     nowText,
     campaign.id,
     staleBefore,
   );
 
-  const utcDayStart = `${nowText.slice(0, 10)}T00:00:00.000Z`;
   const dailyCount = await first<{ reserved: number }>(
     dependencies.db,
-    `SELECT COUNT(*) AS reserved
-     FROM campaign_recipients recipient
-     JOIN campaigns owner_campaign ON owner_campaign.id = recipient.campaign_id
-     WHERE owner_campaign.user_id = ?
-       AND ((recipient.sending_status = 'SENT' AND recipient.sent_at >= ?)
-         OR (recipient.sending_status = 'PROCESSING' AND recipient.updated_at >= ?))`,
+    `SELECT COALESCE((SELECT sent_count FROM daily_send_counts WHERE user_id = ? AND day = ?), 0)
+      + (SELECT COUNT(*) FROM campaign_recipients recipient
+        JOIN campaigns owner_campaign ON owner_campaign.id = recipient.campaign_id
+        WHERE owner_campaign.user_id = ? AND recipient.sending_status IN ('PROCESSING', 'UNKNOWN')) AS reserved`,
     user.id,
-    utcDayStart,
-    utcDayStart,
+    nowText.slice(0, 10),
+    user.id,
   );
   const remainingDaily = dependencies.config.dailySendLimit - (dailyCount?.reserved ?? 0);
-  if (remainingDaily <= 0) throw new ApiError(429, 'Daily sending limit reached');
+  if (remainingDaily <= 0) throw new ApiError(429, 'You reached the daily email limit. Try tomorrow.');
 
-  const claimed = await dependencies.db.prepare(
-    `UPDATE campaign_recipients
+  const claimed = await dependencies.db
+    .prepare(
+      `UPDATE campaign_recipients
      SET sending_status = 'PROCESSING', updated_at = ?, attempt_count = attempt_count + 1
      WHERE id IN (
        SELECT pending.id FROM campaign_recipients pending
        JOIN campaigns owner_campaign ON owner_campaign.id = pending.campaign_id
        WHERE pending.campaign_id = ? AND pending.sending_status = 'PENDING'
          AND owner_campaign.user_id = ?
+         AND owner_campaign.status <> 'CANCELLED'
+         AND EXISTS (SELECT 1 FROM users WHERE id = owner_campaign.user_id AND status = 'ACTIVE')
        ORDER BY pending.created_at, pending.id
        LIMIT MIN(?, MAX(0, ? - (
-         SELECT COUNT(*) FROM campaign_recipients reserved
+         SELECT COALESCE((SELECT sent_count FROM daily_send_counts WHERE user_id = ? AND day = ?), 0)
+         + (SELECT COUNT(*) FROM campaign_recipients reserved
          JOIN campaigns reserved_campaign ON reserved_campaign.id = reserved.campaign_id
          WHERE reserved_campaign.user_id = ?
-           AND ((reserved.sending_status = 'SENT' AND reserved.sent_at >= ?)
-             OR (reserved.sending_status = 'PROCESSING' AND reserved.updated_at >= ?))
+           AND reserved.sending_status IN ('PROCESSING', 'UNKNOWN'))
        )))
      )
      AND sending_status = 'PENDING'
      RETURNING *`,
-  ).bind(
-    nowText,
-    campaign.id,
-    user.id,
-    batchSize,
-    dependencies.config.dailySendLimit,
-    user.id,
-    utcDayStart,
-    utcDayStart,
-  ).all<CampaignRecipientRow>();
+    )
+    .bind(
+      nowText,
+      campaign.id,
+      user.id,
+      batchSize,
+      dependencies.config.dailySendLimit,
+      user.id,
+      nowText.slice(0, 10),
+      user.id,
+    )
+    .all<CampaignRecipientRow>();
   const recipients = claimed.results;
   if (recipients.length === 0) {
     await refreshCampaignStatus(campaign.id, user.id, dependencies);
-    return json({ processed: 0, remaining: await pendingCount(campaign.id, dependencies) });
+    return json({
+      processed: 0,
+      remaining: await pendingCount(campaign.id, dependencies),
+    });
   }
 
   let accessToken: string | null = null;
   let senderEmail = '';
+  let accountId: string | undefined;
   if (dependencies.config.emailMode === 'GMAIL') {
     const account = await first<ConnectedEmailAccountRow>(
       dependencies.db,
@@ -1038,10 +1284,11 @@ async function sendCampaignBatch(
       user.id,
     );
     if (!account) {
-      await markRecipientsFailed(recipients, 'No connected Gmail account', dependencies);
+      await releaseRecipients(recipients, dependencies);
       await refreshCampaignStatus(campaign.id, user.id, dependencies);
-      throw new ApiError(409, 'Connect a Gmail account before sending');
+      throw new ApiError(409, GMAIL_EXPIRED);
     }
+    accountId = account.id;
     senderEmail = account.email_address;
     try {
       const refreshToken = await decryptSecret(
@@ -1069,14 +1316,21 @@ async function sendCampaignBatch(
           user.id,
         );
       }
-    } catch {
-      await markRecipientsFailed(recipients, 'Gmail authorization failed', dependencies);
+    } catch (reason) {
+      if (reason instanceof GoogleAccessExpiredError) {
+        await revokeConnection(account.id, user.id, dependencies);
+        await releaseRecipients(recipients, dependencies);
+        await refreshCampaignStatus(campaign.id, user.id, dependencies);
+        throw new ApiError(409, GMAIL_EXPIRED);
+      }
+      await releaseRecipients(recipients, dependencies);
       await refreshCampaignStatus(campaign.id, user.id, dependencies);
       throw new ApiError(502, 'Gmail authorization failed');
     }
   }
 
   for (const recipient of recipients) {
+    let delivered = false;
     try {
       let gmailMessageId: string;
       if (dependencies.config.emailMode === 'MOCK') {
@@ -1095,22 +1349,39 @@ async function sendCampaignBatch(
         });
         gmailMessageId = result.id;
       }
-      await run(
-        dependencies.db,
-        `UPDATE campaign_recipients SET sending_status = 'SENT', gmail_message_id = ?,
+      delivered = true;
+      const sentAt = isoNow(dependencies);
+      await dependencies.db.batch([
+        dependencies.db
+          .prepare(
+            `INSERT INTO daily_send_counts (user_id, day, sent_count)
+          SELECT ?, ?, 1 WHERE EXISTS (
+            SELECT 1 FROM campaign_recipients WHERE id = ? AND sending_status = 'PROCESSING')
+          ON CONFLICT(user_id, day) DO UPDATE SET sent_count = sent_count + 1`,
+          )
+          .bind(user.id, sentAt.slice(0, 10), recipient.id),
+        dependencies.db
+          .prepare(
+            `UPDATE campaign_recipients SET sending_status = 'SENT', gmail_message_id = ?,
            sent_at = ?, error_message = NULL, updated_at = ?
          WHERE id = ? AND sending_status = 'PROCESSING'`,
-        gmailMessageId,
-        nowText,
-        nowText,
-        recipient.id,
-      );
-    } catch {
+          )
+          .bind(gmailMessageId, sentAt, sentAt, recipient.id),
+      ]);
+    } catch (reason) {
+      if (!delivered && reason instanceof GoogleAccessExpiredError && accountId) {
+        await revokeConnection(accountId, user.id, dependencies);
+        await releaseRecipients(recipients, dependencies);
+        await refreshCampaignStatus(campaign.id, user.id, dependencies);
+        throw new ApiError(409, GMAIL_EXPIRED);
+      }
       await run(
         dependencies.db,
-        `UPDATE campaign_recipients SET sending_status = 'FAILED',
-           error_message = 'Delivery failed', updated_at = ?
+        `UPDATE campaign_recipients SET sending_status = ?,
+           error_message = ?, updated_at = ?
          WHERE id = ? AND sending_status = 'PROCESSING'`,
+        delivered ? 'UNKNOWN' : 'FAILED',
+        delivered ? 'Not sure - please check your Gmail Sent folder' : 'Delivery failed',
         nowText,
         recipient.id,
       );
@@ -1125,18 +1396,29 @@ async function sendCampaignBatch(
   });
 }
 
-async function markRecipientsFailed(
+async function revokeConnection(id: string, userId: string, dependencies: ApiDependencies): Promise<void> {
+  await run(
+    dependencies.db,
+    `UPDATE connected_email_accounts SET connection_status = 'REVOKED', updated_at = ?
+     WHERE id = ? AND user_id = ?`,
+    isoNow(dependencies),
+    id,
+    userId,
+  );
+}
+
+async function releaseRecipients(
   recipients: CampaignRecipientRow[],
-  safeMessage: string,
   dependencies: ApiDependencies,
 ): Promise<void> {
-  const now = isoNow(dependencies);
   await dependencies.db.batch(
     recipients.map((recipient) =>
-      dependencies.db.prepare(
-        `UPDATE campaign_recipients SET sending_status = 'FAILED', error_message = ?, updated_at = ?
-         WHERE id = ? AND sending_status = 'PROCESSING'`,
-      ).bind(safeMessage, now, recipient.id),
+      dependencies.db
+        .prepare(
+          `UPDATE campaign_recipients SET sending_status = 'PENDING', error_message = NULL, updated_at = ?
+       WHERE id = ? AND sending_status = 'PROCESSING'`,
+        )
+        .bind(isoNow(dependencies), recipient.id),
     ),
   );
 }
@@ -1188,10 +1470,7 @@ async function refreshCampaignStatus(
   );
 }
 
-export async function handleApiRequest(
-  request: Request,
-  dependencies: ApiDependencies,
-): Promise<Response> {
+async function routeApiRequest(request: Request, dependencies: ApiDependencies): Promise<Response> {
   const path = new URL(request.url).pathname;
   try {
     if (!path.startsWith('/api/')) throw new ApiError(404, 'Route not found');
@@ -1200,9 +1479,7 @@ export async function handleApiRequest(
       return json({ status: 'UP', application: 'ReachFlow' });
     }
     if (path.startsWith('/api/auth/')) {
-      if (
-        ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)
-      ) {
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
         ensureSameOrigin(request, dependencies.config);
       }
       return await handleAuth(request, path, dependencies);
@@ -1224,6 +1501,29 @@ export async function handleApiRequest(
     }
     return json({ error: 'Request could not be completed' }, 500);
   }
+}
+
+export async function handleApiRequest(request: Request, dependencies: ApiDependencies): Promise<Response> {
+  let renewal: string | undefined;
+  const sessionUser = await readSession(
+    request,
+    dependencies.db,
+    dependencies.config.sessionSecret,
+    getNow(dependencies),
+    (cookie) => {
+      renewal = cookie;
+    },
+  );
+  const response = await routeApiRequest(request, { ...dependencies, sessionUser });
+  const clearsOrCreatesSession = response.headers
+    .getSetCookie()
+    .some((cookie) => cookie.startsWith('reachflow_session='));
+  if (renewal && response.status !== 401 && !clearsOrCreatesSession) {
+    response.headers.append('Set-Cookie', renewal);
+    const csrf = readCsrfToken(request);
+    if (csrf) response.headers.append('Set-Cookie', csrfCookie(csrf, true));
+  }
+  return response;
 }
 
 export async function debugQueryResult<T>(

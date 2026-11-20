@@ -39,7 +39,7 @@ function insertRecipient(db, id, campaignId, email) {
 test('GET /api/health returns the ReachFlow health response', async () => {
   const response = await worker.fetch(
     new Request('http://localhost/api/health'),
-    {},
+    { ENVIRONMENT: 'development' },
   );
 
   assert.equal(response.status, 200);

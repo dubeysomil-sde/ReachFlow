@@ -14,7 +14,7 @@ class SQLitePreparedStatement {
 
   async first(columnName) {
     const row = this.database.prepare(this.query).get(...this.values) ?? null;
-    return columnName && row ? row[columnName] ?? null : row;
+    return columnName && row ? (row[columnName] ?? null) : row;
   }
 
   async all() {
@@ -39,9 +39,7 @@ export class SQLiteDatabaseAdapter {
   static async createWithMigrations() {
     const adapter = new SQLiteDatabaseAdapter();
     const directory = new URL('../migrations/', import.meta.url);
-    const files = (await readdir(directory))
-      .filter((name) => /^\d+.*\.sql$/.test(name))
-      .sort();
+    const files = (await readdir(directory)).filter((name) => /^\d+.*\.sql$/.test(name)).sort();
     for (const file of files) {
       adapter.database.exec(await readFile(new URL(file, directory), 'utf8'));
     }
@@ -56,7 +54,10 @@ export class SQLiteDatabaseAdapter {
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const results = [];
-      for (const statement of statements) results.push(await statement.run());
+      for (const statement of statements) {
+        const result = this.database.prepare(statement.query).run(...statement.values);
+        results.push({ success: true, meta: { changes: Number(result.changes) } });
+      }
       this.database.exec('COMMIT');
       return results;
     } catch (error) {

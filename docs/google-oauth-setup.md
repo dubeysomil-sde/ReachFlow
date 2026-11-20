@@ -34,8 +34,10 @@ labels may change; verify them before setup.
 Sign-in requests only `openid`, `email`, and `profile`, with authorization
 code flow, state, and PKCE. The email must be Google-verified. Existing active
 users can sign in; new users are subject to `registration_mode` and an
-email-bound invitation unless registration is `PUBLIC`. A verified email
-listed in `ADMIN_EMAILS` is bootstrapped as `ADMIN` only on first registration.
+email-bound invite unless registration is `PUBLIC`. A verified email
+listed in `ADMIN_EMAILS` is bootstrapped as `ADMIN` only on first registration
+and may register while Invite only is enabled without an invite. No other new
+account bypasses the invite rule, and existing users are never auto-promoted.
 
 ## Enable Gmail sending separately
 
@@ -44,11 +46,13 @@ listed in `ADMIN_EMAILS` is bootstrapped as `ADMIN` only on first registration.
    `https://www.googleapis.com/auth/gmail.send`, uses offline access and
    consent, and stores the refresh token only after AES-256-GCM encryption.
    The token encryption key must be configured before this flow can succeed.
+   If Google supplies no refresh token, connection fails with a visible error;
+   it is not shown as a new connected sender.
 3. Keep `EMAIL_MODE=MOCK` until a controlled verification is approved. The
    browser mock never invokes Google and does not send email.
 4. If testing actual Gmail calls, use only explicitly approved test accounts
    and send a single message to the account owner. Confirm the sender identity,
-   exact recipient, subject, body, and attachment before authorizing the send.
+   exact receiver's address, subject, message, and attachment before approving the send.
 
 ## Testing-mode token expiry and public verification
 
@@ -59,6 +63,13 @@ working after that period and require the sender to reconnect. This is a Google
 testing-mode restriction, not a ReachFlow retry condition; failed authorization
 must be surfaced and should not trigger automatic resending of an uncertain
 message.
+
+On `invalid_grant`, ReachFlow marks Gmail access revoked but keeps the app
+session. Unsent emails remain Waiting. Reconnect Gmail, then use **Continue
+sending** in History; Sent and uncertain results are not retried. After a
+redirect/reload, reselect the PDF if the original send had one. Account removal
+accepts Google's already-invalid token response as completed revocation;
+network/server revocation failures still block removal.
 
 Before any public release, verify Google's current verification requirements
 for the selected audience and requested Gmail scope. Expect to provide a

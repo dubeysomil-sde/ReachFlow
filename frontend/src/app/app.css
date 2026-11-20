@@ -4,6 +4,25 @@ app-root {
   color: #23332a;
 }
 
+.history-selection {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px 0;
+}
+
+.history-selection input {
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+}
+
+.status-recipient .status-tag {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .app-shell {
   min-height: 100vh;
   background:
@@ -881,6 +900,10 @@ button:disabled {
   grid-template-columns: minmax(220px, 0.72fr) minmax(0, 1.8fr);
   align-items: start;
   gap: 16px;
+}
+
+.template-layout {
+  margin-bottom: 17px;
 }
 
 .template-sidebar,

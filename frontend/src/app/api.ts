@@ -1,4 +1,4 @@
-import { HttpClient, HttpHeaders } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http';
 import { InjectionToken } from '@angular/core';
 import { firstValueFrom } from 'rxjs';
 
@@ -102,6 +102,8 @@ export interface AdminData {
 
 export interface AppApi {
   readonly mode: 'MOCK' | 'HTTP';
+  readonly emailMode?: 'MOCK' | 'GMAIL';
+  onUnauthorized?: () => void;
   getMe(): Promise<ApiUser | null>;
   startGoogleSignIn(invite?: string): void;
   signInMock(): Promise<ApiUser>;
@@ -112,7 +114,10 @@ export interface AppApi {
   createCampaign(input: CreateCampaignInput): Promise<Campaign>;
   listCampaigns(): Promise<Campaign[]>;
   getCampaign(id: string): Promise<Campaign>;
-  sendBatch(id: string, attachment: ResumeAttachment | null): Promise<{ processed: number; remaining: number }>;
+  sendBatch(
+    id: string,
+    attachment: ResumeAttachment | null,
+  ): Promise<{ processed: number; remaining: number }>;
   cancelCampaign(id: string): Promise<void>;
   retryFailed(id: string): Promise<number>;
   listGmailAccounts(): Promise<GmailAccount[]>;
@@ -122,17 +127,28 @@ export interface AppApi {
   setRegistrationMode(mode: AdminData['registrationMode']): Promise<void>;
   createInvitation(email: string): Promise<Invitation>;
   setUserStatus(id: string, status: UserStatus): Promise<void>;
+  deleteCampaigns(ids: string[] | 'all'): Promise<void>;
+  deleteAccount(confirmation: string): Promise<void>;
+  deleteInvitation(id: string): Promise<void>;
+  deleteUser(id: string): Promise<void>;
+  contactHistory(emails: string[]): Promise<{ email: string; sent_at: string }[]>;
 }
 
 export const APP_API = new InjectionToken<AppApi>('APP_API');
 
 export class HttpApi implements AppApi {
   readonly mode = 'HTTP' as const;
+  emailMode: 'MOCK' | 'GMAIL' = 'MOCK';
+  onUnauthorized?: () => void;
+  private csrfRequest: Promise<string> | null = null;
 
   constructor(private readonly http: HttpClient) {}
 
   async getMe(): Promise<ApiUser | null> {
-    const response = await this.get<{ user: ApiUser | null }>('/api/auth/me');
+    const response = await this.get<{ user: ApiUser | null; emailMode: 'MOCK' | 'GMAIL' }>(
+      '/api/auth/me',
+    );
+    this.emailMode = response.emailMode;
     return response.user;
   }
 
@@ -142,7 +158,7 @@ export class HttpApi implements AppApi {
   }
 
   async signInMock(): Promise<ApiUser> {
-    throw new Error('Mock sign-in is unavailable in HTTP mode');
+    throw new Error('Use Google to sign in here.');
   }
 
   async logout(): Promise<void> {
@@ -153,7 +169,9 @@ export class HttpApi implements AppApi {
     return (await this.get<{ templates: EmailTemplate[] }>('/api/templates')).templates;
   }
 
-  async saveTemplate(template: Omit<EmailTemplate, 'id'> & { id?: string }): Promise<EmailTemplate> {
+  async saveTemplate(
+    template: Omit<EmailTemplate, 'id'> & { id?: string },
+  ): Promise<EmailTemplate> {
     if (template.id) {
       await this.put(`/api/templates/${encodeURIComponent(template.id)}`, template);
       return template as EmailTemplate;
@@ -195,7 +213,12 @@ export class HttpApi implements AppApi {
   }
 
   async retryFailed(id: string): Promise<number> {
-    return (await this.post<{ retried: number }>(`/api/campaigns/${encodeURIComponent(id)}/retry-failed`, {})).retried;
+    return (
+      await this.post<{ retried: number }>(
+        `/api/campaigns/${encodeURIComponent(id)}/retry-failed`,
+        {},
+      )
+    ).retried;
   }
 
   async listGmailAccounts(): Promise<GmailAccount[]> {
@@ -224,7 +247,9 @@ export class HttpApi implements AppApi {
   }
 
   async createInvitation(email: string): Promise<Invitation> {
-    const response = await this.post<{ invitation: Invitation }>('/api/admin/invitations', { email });
+    const response = await this.post<{ invitation: Invitation }>('/api/admin/invitations', {
+      email,
+    });
     return response.invitation;
   }
 
@@ -232,32 +257,98 @@ export class HttpApi implements AppApi {
     await this.post(`/api/admin/users/${encodeURIComponent(id)}/status`, { status });
   }
 
+  async deleteCampaigns(ids: string[] | 'all'): Promise<void> {
+    if (ids !== 'all' && ids.length === 1) {
+      await this.delete(`/api/campaigns/${encodeURIComponent(ids[0])}`);
+    } else {
+      await this.delete('/api/campaigns', ids === 'all' ? { all: true } : { ids });
+    }
+  }
+
+  async deleteAccount(confirmation: string): Promise<void> {
+    await this.delete('/api/auth/account', { confirmation });
+  }
+
+  async deleteInvitation(id: string): Promise<void> {
+    await this.delete(`/api/admin/invitations/${encodeURIComponent(id)}`);
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    await this.delete(`/api/admin/users/${encodeURIComponent(id)}`);
+  }
+
+  async contactHistory(emails: string[]): Promise<{ email: string; sent_at: string }[]> {
+    return (
+      await this.post<{ contacts: { email: string; sent_at: string }[] }>(
+        '/api/campaigns/contact-history',
+        {
+          emails,
+        },
+      )
+    ).contacts;
+  }
+
   private get<T>(url: string): Promise<T> {
-    return firstValueFrom(this.http.get<T>(url, { withCredentials: true }));
+    return this.request(firstValueFrom(this.http.get<T>(url, { withCredentials: true })));
   }
 
   private async post<T = unknown>(url: string, body: unknown): Promise<T> {
-    const csrf = await this.get<{ csrfToken: string }>('/api/auth/csrf');
-    return firstValueFrom(this.http.post<T>(url, body, {
-      withCredentials: true,
-      headers: new HttpHeaders({ 'X-CSRF-Token': csrf.csrfToken }),
-    }));
+    const csrfToken = await this.csrfToken();
+    return this.request(
+      firstValueFrom(
+        this.http.post<T>(url, body, {
+          withCredentials: true,
+          headers: new HttpHeaders({ 'X-CSRF-Token': csrfToken }),
+        }),
+      ),
+    );
   }
 
   private async put<T = unknown>(url: string, body: unknown): Promise<T> {
-    const csrf = await this.get<{ csrfToken: string }>('/api/auth/csrf');
-    return firstValueFrom(this.http.put<T>(url, body, {
-      withCredentials: true,
-      headers: new HttpHeaders({ 'X-CSRF-Token': csrf.csrfToken }),
-    }));
+    const csrfToken = await this.csrfToken();
+    return this.request(
+      firstValueFrom(
+        this.http.put<T>(url, body, {
+          withCredentials: true,
+          headers: new HttpHeaders({ 'X-CSRF-Token': csrfToken }),
+        }),
+      ),
+    );
   }
 
-  private async delete<T = unknown>(url: string): Promise<T> {
-    const csrf = await this.get<{ csrfToken: string }>('/api/auth/csrf');
-    return firstValueFrom(this.http.delete<T>(url, {
-      withCredentials: true,
-      headers: new HttpHeaders({ 'X-CSRF-Token': csrf.csrfToken }),
-    }));
+  private async delete<T = unknown>(url: string, body?: unknown): Promise<T> {
+    const csrfToken = await this.csrfToken();
+    return this.request(
+      firstValueFrom(
+        this.http.delete<T>(url, {
+          withCredentials: true,
+          headers: new HttpHeaders({ 'X-CSRF-Token': csrfToken }),
+          ...(body === undefined ? {} : { body }),
+        }),
+      ),
+    );
+  }
+
+  private async request<T>(request: Promise<T>): Promise<T> {
+    try {
+      return await request;
+    } catch (reason) {
+      if (reason instanceof HttpErrorResponse && reason.status === 401) {
+        this.csrfRequest = null;
+        this.onUnauthorized?.();
+      }
+      throw reason;
+    }
+  }
+
+  private csrfToken(): Promise<string> {
+    this.csrfRequest ??= this.get<{ csrfToken: string }>('/api/auth/csrf')
+      .then((response) => response.csrfToken)
+      .catch((reason: unknown) => {
+        this.csrfRequest = null;
+        throw reason;
+      });
+    return this.csrfRequest;
   }
 }
 
@@ -269,15 +360,18 @@ interface MockState {
   users: AdminUser[];
   invitations: Invitation[];
   registrationMode: AdminData['registrationMode'];
+  dailyCounts?: Record<string, number>;
 }
 
 const STORAGE_KEY = 'reachflow.mock.v1';
-const SAMPLE_SUBJECT = 'A quick introduction about [Role]';
-const SAMPLE_BODY =
-  'Hi [Name],\n\nI came across your work at [Company] and wanted to share an opportunity for [Role] ([JobId]).\n\nWould you be open to a short conversation?\n\nBest,\nYour name';
+export const SAMPLE_SUBJECT = 'A quick introduction about [Role]';
+export const SAMPLE_BODY =
+  'Hi [Name],\n\nI came across your work at [Company].\n\nRole: [Role]\nJob ID: [JobId]\n\nWould you be open to a short conversation?\n\nBest,\nYour name';
 
 export class MockApi implements AppApi {
   readonly mode = 'MOCK' as const;
+  onUnauthorized?: () => void;
+  private mockUser: ApiUser | null = null;
 
   constructor(
     private readonly storage: Pick<Storage, 'getItem' | 'setItem'> = localStorage,
@@ -374,14 +468,23 @@ export class MockApi implements AppApi {
 
   async getCampaign(id: string): Promise<Campaign> {
     const campaign = this.state().campaigns.find((entry) => entry.id === id);
-    if (!campaign) throw new Error('Campaign not found');
+    if (!campaign) throw new Error('Send not found.');
     return campaign;
   }
 
-  async sendBatch(id: string, _attachment: ResumeAttachment | null): Promise<{ processed: number; remaining: number }> {
+  async sendBatch(
+    id: string,
+    _attachment: ResumeAttachment | null,
+  ): Promise<{ processed: number; remaining: number }> {
     const state = this.state();
     const campaign = this.findCampaign(state, id);
-    const pending = (campaign.recipients ?? []).filter((recipient) => recipient.sending_status === 'PENDING').slice(0, 5);
+    const day = this.now().toISOString().slice(0, 10);
+    state.dailyCounts ??= {};
+    const available = 100 - (state.dailyCounts[day] ?? 0);
+    if (available <= 0) throw new Error('You reached the daily email limit. Try tomorrow.');
+    const pending = (campaign.recipients ?? [])
+      .filter((recipient) => recipient.sending_status === 'PENDING')
+      .slice(0, Math.min(5, available));
     for (const recipient of pending) {
       if (this.random() < 0.1) {
         recipient.sending_status = 'FAILED';
@@ -391,11 +494,18 @@ export class MockApi implements AppApi {
         recipient.sending_status = 'SENT';
         recipient.sent_at = this.now().toISOString();
         campaign.sent_count += 1;
+        state.dailyCounts[day] = (state.dailyCounts[day] ?? 0) + 1;
       }
     }
-    const remaining = (campaign.recipients ?? []).filter((recipient) => recipient.sending_status === 'PENDING').length;
-    campaign.sent_count = (campaign.recipients ?? []).filter((recipient) => recipient.sending_status === 'SENT').length;
-    campaign.failed_count = (campaign.recipients ?? []).filter((recipient) => recipient.sending_status === 'FAILED').length;
+    const remaining = (campaign.recipients ?? []).filter(
+      (recipient) => recipient.sending_status === 'PENDING',
+    ).length;
+    campaign.sent_count = (campaign.recipients ?? []).filter(
+      (recipient) => recipient.sending_status === 'SENT',
+    ).length;
+    campaign.failed_count = (campaign.recipients ?? []).filter(
+      (recipient) => recipient.sending_status === 'FAILED',
+    ).length;
     campaign.status = remaining ? 'SENDING' : 'COMPLETED';
     this.save(state);
     return { processed: pending.length, remaining };
@@ -423,7 +533,9 @@ export class MockApi implements AppApi {
       }
     }
     if (retried) campaign.status = 'SENDING';
-    campaign.failed_count = (campaign.recipients ?? []).filter((recipient) => recipient.sending_status === 'FAILED').length;
+    campaign.failed_count = (campaign.recipients ?? []).filter(
+      (recipient) => recipient.sending_status === 'FAILED',
+    ).length;
     this.save(state);
     return retried;
   }
@@ -482,34 +594,114 @@ export class MockApi implements AppApi {
       link: `${window.location.origin}/?invite=${token}`,
     };
     const state = this.state();
-    state.invitations.unshift(invitation);
+    const { link: _link, ...saved } = invitation;
+    state.invitations.unshift(saved);
     this.save(state);
     return invitation;
   }
 
   async setUserStatus(id: string, status: UserStatus): Promise<void> {
     const state = this.state();
-    state.users = state.users.map((user) => user.id === id ? { ...user, status } : user);
+    state.users = state.users.map((user) => (user.id === id ? { ...user, status } : user));
     this.save(state);
+  }
+
+  async deleteCampaigns(ids: string[] | 'all'): Promise<void> {
+    const state = this.state();
+    const selected = state.campaigns.filter((entry) => ids === 'all' || ids.includes(entry.id));
+    if (
+      selected.some(
+        (entry) =>
+          entry.status === 'SENDING' ||
+          entry.recipients?.some((person) => person.sending_status === 'PROCESSING'),
+      )
+    ) {
+      throw new Error('Stop it first');
+    }
+    state.campaigns = state.campaigns.filter((entry) => !selected.includes(entry));
+    this.save(state);
+  }
+
+  async deleteAccount(confirmation: string): Promise<void> {
+    if (confirmation !== 'DELETE') throw new Error('Type DELETE to remove your account.');
+    const state = this.state();
+    if (state.campaigns.some((entry) => entry.status === 'SENDING'))
+      throw new Error('Stop it first');
+    this.save({
+      user: null,
+      templates: [],
+      campaigns: [],
+      accounts: [],
+      users: [],
+      invitations: [],
+      registrationMode: 'INVITE_ONLY',
+      dailyCounts: {},
+    });
+  }
+
+  async deleteInvitation(id: string): Promise<void> {
+    const state = this.state();
+    state.invitations = state.invitations.filter((entry) => entry.id !== id);
+    this.save(state);
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    const state = this.state();
+    if (state.user?.id === id) throw new Error('You cannot remove your own admin account here.');
+    state.users = state.users.filter((entry) => entry.id !== id);
+    this.save(state);
+  }
+
+  async contactHistory(emails: string[]): Promise<{ email: string; sent_at: string }[]> {
+    const contacts = new Map<string, string>();
+    for (const send of this.state().campaigns) {
+      for (const person of send.recipients ?? []) {
+        if (
+          person.sending_status === 'SENT' &&
+          person.sent_at &&
+          emails.includes(person.recipient_email)
+        ) {
+          const previous = contacts.get(person.recipient_email);
+          if (!previous || previous < person.sent_at)
+            contacts.set(person.recipient_email, person.sent_at);
+        }
+      }
+    }
+    return [...contacts].map(([email, sent_at]) => ({ email, sent_at }));
   }
 
   private state(): MockState {
     const stored = this.storage.getItem(STORAGE_KEY);
     if (stored) {
       try {
-        return JSON.parse(stored) as MockState;
+        const state = JSON.parse(stored) as MockState;
+        state.user = this.mockUser;
+        if (!state.dailyCounts) {
+          state.dailyCounts = {};
+          for (const send of state.campaigns) {
+            for (const person of send.recipients ?? []) {
+              if (person.sending_status === 'SENT' && person.sent_at) {
+                const day = person.sent_at.slice(0, 10);
+                state.dailyCounts[day] = (state.dailyCounts[day] ?? 0) + 1;
+              }
+            }
+          }
+        }
+        return state;
       } catch {
         this.storage.setItem(STORAGE_KEY, '');
       }
     }
     return {
-      user: null,
-      templates: [{
-        id: 'mock-sample',
-        template_name: 'Sample referral',
-        default_subject: SAMPLE_SUBJECT,
-        default_body: SAMPLE_BODY,
-      }],
+      user: this.mockUser,
+      templates: [
+        {
+          id: 'mock-sample',
+          template_name: 'Sample message',
+          default_subject: SAMPLE_SUBJECT,
+          default_body: SAMPLE_BODY,
+        },
+      ],
       campaigns: [],
       accounts: [],
       users: [],
@@ -519,12 +711,13 @@ export class MockApi implements AppApi {
   }
 
   private save(state: MockState): void {
-    this.storage.setItem(STORAGE_KEY, JSON.stringify(state));
+    this.mockUser = state.user;
+    this.storage.setItem(STORAGE_KEY, JSON.stringify({ ...state, user: null }));
   }
 
   private findCampaign(state: MockState, id: string): Campaign {
     const campaign = state.campaigns.find((entry) => entry.id === id);
-    if (!campaign) throw new Error('Campaign not found');
+    if (!campaign) throw new Error('Send not found.');
     return campaign;
   }
 }
@@ -539,4 +732,39 @@ export function errorMessage(error: unknown): string {
   }
   if (error instanceof Error) return error.message;
   return 'The request could not be completed.';
+}
+
+export async function runCampaignBatches(
+  api: AppApi,
+  id: string,
+  attachment: ResumeAttachment | null,
+  stopped: () => boolean,
+  progress: (processed: number) => void,
+): Promise<void> {
+  let processed = 0;
+  while (!stopped()) {
+    const result = await api.sendBatch(id, attachment);
+    processed += result.processed;
+    progress(processed);
+    if (!result.remaining || !result.processed) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  await api.cancelCampaign(id);
+}
+
+export function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    DRAFT: 'Waiting',
+    PENDING: 'Waiting',
+    PROCESSING: 'Sending',
+    SENDING: 'Sending',
+    SENT: 'Sent',
+    COMPLETED: 'Done',
+    FAILED: 'Failed',
+    CANCELLED: 'Stopped',
+    UNKNOWN: 'Not sure - please check your Gmail Sent folder',
+    ACTIVE: 'Active',
+    DISABLED: 'Disabled',
+  };
+  return labels[status] ?? status;
 }

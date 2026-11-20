@@ -12,6 +12,7 @@ export interface AppConfig {
 }
 
 export interface AppEnvironment {
+  ENVIRONMENT?: string;
   DB: import('./db/d1Database').D1Binding;
   ASSETS?: { fetch(request: Request): Promise<Response> };
   EMAIL_MODE?: string;
@@ -24,19 +25,59 @@ export interface AppEnvironment {
   APP_BASE_URL?: string;
 }
 
+export class ConfigurationError extends Error {}
+
 export function readConfig(env: AppEnvironment): AppConfig {
+  const production = env.ENVIRONMENT !== 'development';
+  if (production || env.EMAIL_MODE?.toUpperCase() === 'GMAIL') {
+    for (const key of [
+      'EMAIL_MODE',
+      'APP_BASE_URL',
+      'GOOGLE_CLIENT_ID',
+      'GOOGLE_CLIENT_SECRET',
+      'SESSION_SECRET',
+      'TOKEN_ENCRYPTION_KEY',
+    ] as const) {
+      if (!env[key]?.trim())
+        throw new ConfigurationError(`ReachFlow configuration error: ${key} is required.`);
+    }
+    if (env.SESSION_SECRET!.length < 32) {
+      throw new ConfigurationError(
+        'ReachFlow configuration error: SESSION_SECRET needs at least 32 characters.',
+      );
+    }
+    let keyLength = 0;
+    try {
+      keyLength = atob(env.TOKEN_ENCRYPTION_KEY!).length;
+    } catch {
+      /* Report the invalid configuration below. */
+    }
+    if (keyLength !== 32) {
+      throw new ConfigurationError(
+        'ReachFlow configuration error: TOKEN_ENCRYPTION_KEY must be base64 for 32 bytes.',
+      );
+    }
+  }
   const emailMode = (env.EMAIL_MODE ?? 'MOCK').toUpperCase();
   if (emailMode !== 'MOCK' && emailMode !== 'GMAIL') {
-    throw new Error('EMAIL_MODE must be MOCK or GMAIL');
+    throw new ConfigurationError('EMAIL_MODE must be explicitly set to MOCK or GMAIL');
   }
   const dailySendLimit = Number(env.DAILY_SEND_LIMIT ?? '100');
   if (!Number.isInteger(dailySendLimit) || dailySendLimit < 1) {
-    throw new Error('DAILY_SEND_LIMIT must be a positive integer');
+    throw new ConfigurationError('DAILY_SEND_LIMIT must be a positive integer');
   }
   const appBaseUrl = env.APP_BASE_URL ?? 'http://localhost:4200';
-  const parsedBaseUrl = new URL(appBaseUrl);
+  let parsedBaseUrl: URL;
+  try {
+    parsedBaseUrl = new URL(appBaseUrl);
+  } catch {
+    throw new ConfigurationError('APP_BASE_URL must be a valid HTTPS origin');
+  }
+  if (production && parsedBaseUrl.protocol !== 'https:') {
+    throw new ConfigurationError('APP_BASE_URL must use HTTPS in production');
+  }
   if (parsedBaseUrl.protocol !== 'https:' && parsedBaseUrl.hostname !== 'localhost') {
-    throw new Error('APP_BASE_URL must use HTTPS outside localhost');
+    throw new ConfigurationError('APP_BASE_URL must use HTTPS outside localhost');
   }
 
   return {

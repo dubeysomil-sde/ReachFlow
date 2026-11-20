@@ -3,13 +3,7 @@ export type UserStatus = 'ACTIVE' | 'DISABLED';
 export type EmailProvider = 'GMAIL';
 export type EmailConnectionStatus = 'CONNECTED' | 'REVOKED' | 'ERROR';
 export type CampaignStatus = 'DRAFT' | 'SENDING' | 'COMPLETED' | 'CANCELLED';
-export type RecipientSendingStatus =
-  | 'PENDING'
-  | 'PROCESSING'
-  | 'SENT'
-  | 'FAILED'
-  | 'CANCELLED'
-  | 'UNKNOWN';
+export type RecipientSendingStatus = 'PENDING' | 'PROCESSING' | 'SENT' | 'FAILED' | 'CANCELLED' | 'UNKNOWN';
 
 export interface UserRow {
   id: string;
@@ -97,4 +91,10 @@ export interface AppSettingRow {
   key: string;
   value: string;
   updated_at: string;
+}
+
+export interface DailySendCountRow {
+  user_id: string;
+  day: string;
+  sent_count: number;
 }

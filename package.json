@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "deploy": "npm --prefix frontend run build && npm --prefix backend exec -- wrangler deploy --config backend\\wrangler.jsonc",
     "frontend": "npm --prefix frontend start",
     "backend": "npm --prefix backend run dev",
     "build:frontend": "npm --prefix frontend run build",

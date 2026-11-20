@@ -1,5 +1,6 @@
 # Copy to backend/.dev.vars. This file is a template; do not put real secrets here.
 EMAIL_MODE=MOCK
+ENVIRONMENT=development
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 SESSION_SECRET=replace-with-a-random-secret-at-least-32-characters

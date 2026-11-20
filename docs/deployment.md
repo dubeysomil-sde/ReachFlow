@@ -1,5 +1,11 @@
 # Manual Cloudflare deployment (future)
 
+For the ordered Windows PowerShell 5.1 go-live sequence, secret generation,
+admin bootstrap and explicit production settings, use [go-live.md](go-live.md).
+The initial deployment intentionally rejects API requests until its required
+settings/secrets are supplied. The root `npm run deploy` script builds the
+production frontend before deploying with project-local Wrangler.
+
 This is a runbook only. No Cloudflare resources have been created or changed,
 and no deployment has been run. Verify current Cloudflare dashboard labels and
 account limits before proceeding.
@@ -23,7 +29,7 @@ account limits before proceeding.
 1. In the intended Cloudflare account, create a D1 database for the intended
    environment and note its database name and ID.
 2. Update the `DB` binding and `database_id` in `backend/wrangler.jsonc` to
-   that database. Never deploy the all-zero placeholder ID.
+   that database. Never deploy the all-zero example ID.
 3. Apply and verify migrations from a trusted deployment environment, after
    reviewing the exact account and target:
 

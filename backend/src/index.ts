@@ -1,5 +1,5 @@
 import { handleApiRequest } from './api/router.ts';
-import { readConfig, type AppEnvironment } from './config.ts';
+import { ConfigurationError, readConfig, type AppEnvironment } from './config.ts';
 import { D1DatabaseAdapter } from './db/d1Database.ts';
 import { FetchGoogleClient } from './google/googleClient.ts';
 
@@ -9,12 +9,25 @@ const STATIC_SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
-  'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'",
+  'Content-Security-Policy':
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'",
 };
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const config = readConfig(env);
+    let config;
+    try {
+      config = readConfig(env);
+    } catch (reason) {
+      if (!(reason instanceof ConfigurationError)) throw reason;
+      return Response.json(
+        { error: reason.message },
+        {
+          status: 503,
+          headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' },
+        },
+      );
+    }
     const dependencies = {
       db: new D1DatabaseAdapter(env.DB),
       google: new FetchGoogleClient({

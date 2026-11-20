@@ -25,16 +25,18 @@ export class FakeGoogleClient {
   }
 
   async exchangeCode(code, redirectUri, codeVerifier) {
+    if (this.exchangeError) throw this.exchangeError;
     this.lastExchange = { code, redirectUri, codeVerifier };
     return {
       accessToken: 'test-access-token',
-      refreshToken: 'test-refresh-token',
+      refreshToken: this.withoutRefreshToken ? undefined : 'test-refresh-token',
       expiresIn: 3600,
     };
   }
 
   async refreshAccessToken(refreshToken) {
     this.refreshCalls.push(refreshToken);
+    if (this.refreshError) throw this.refreshError;
     return { accessToken: 'test-refreshed-access-token', expiresIn: 3600 };
   }
 
@@ -50,5 +52,6 @@ export class FakeGoogleClient {
 
   async revokeToken(token) {
     this.revokedTokens.push(token);
+    if (this.revokeError) throw this.revokeError;
   }
 }

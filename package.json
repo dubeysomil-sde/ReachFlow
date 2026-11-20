@@ -1,0 +1,14 @@
+{
+  "name": "reachflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "frontend": "npm --prefix frontend start",
+    "backend": "npm --prefix backend run dev",
+    "build:frontend": "npm --prefix frontend run build",
+    "test:frontend": "npm --prefix frontend test",
+    "test:backend": "npm --prefix backend test",
+    "typecheck:backend": "npm --prefix backend run typecheck"
+  }
+}

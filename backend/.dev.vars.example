@@ -1,0 +1,10 @@
+# Copy to backend/.dev.vars. This file is a template; do not put real secrets here.
+EMAIL_MODE=MOCK
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+SESSION_SECRET=replace-with-a-random-secret-at-least-32-characters
+# Replace with base64-encoded random 32-byte key before connecting Gmail.
+TOKEN_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+ADMIN_EMAILS=
+DAILY_SEND_LIMIT=100
+APP_BASE_URL=http://localhost:4200

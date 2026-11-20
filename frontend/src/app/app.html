@@ -1,0 +1,411 @@
+<div class="app-shell">
+  @if (isMock) {
+    <div class="mock-banner" role="status">
+      <span class="mock-dot"></span>
+      MOCK MODE — no real emails are sent
+    </div>
+  }
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="ReachFlow home">
+      <span class="brand-mark">R</span>
+      <span>ReachFlow</span>
+    </a>
+    @if (user(); as currentUser) {
+      <nav class="main-nav" aria-label="Main navigation">
+        <button [class.active]="screen() === 'compose' || screen() === 'review'" (click)="navigate('compose')">Compose</button>
+        <button [class.active]="screen() === 'templates'" (click)="navigate('templates')">Templates</button>
+        <button [class.active]="screen() === 'history'" (click)="navigate('history')">Campaign history</button>
+        @if (canOpenAdmin) {
+          <button [class.active]="screen() === 'admin'" (click)="navigate('admin')">Admin</button>
+        }
+      </nav>
+      <div class="account-menu">
+        <button class="account-button" (click)="mockAccountOpen = !mockAccountOpen" [attr.aria-expanded]="mockAccountOpen">
+          <span class="avatar">{{ currentUser.name.slice(0, 1) }}</span>
+          <span class="account-name">{{ currentUser.name }}</span>
+          <span aria-hidden="true">⌄</span>
+        </button>
+        @if (mockAccountOpen) {
+          <div class="account-popover">
+            <strong>{{ currentUser.email }}</strong>
+            <span>{{ currentUser.role }} account</span>
+            <div class="popover-divider"></div>
+            <p class="popover-label">Sending account</p>
+            @for (account of gmailAccounts(); track account.id) {
+              @if (account.connection_status === 'CONNECTED') {
+                <div class="connected-account">
+                  <span>{{ account.email_address }}</span>
+                  <button class="text-button" (click)="disconnectGmail(account)">Disconnect</button>
+                </div>
+              }
+            }
+            <button class="text-button" (click)="connectGmail()">
+              {{ hasConnectedGmail ? 'Reconnect Gmail' : 'Connect Gmail' }}
+            </button>
+            <button class="sign-out-button" (click)="signOut()">Sign out</button>
+          </div>
+        }
+      </div>
+    } @else {
+      <span class="environment-label">PERSONALIZED OUTREACH</span>
+    }
+  </header>
+
+  @if (error()) {
+    <div class="notice notice-error" role="alert">
+      <span>{{ error() }}</span>
+      <button aria-label="Dismiss error" (click)="clearMessages()">×</button>
+    </div>
+  }
+  @if (toast()) {
+    <div class="notice notice-success" role="status">
+      <span>{{ toast() }}</span>
+      <button aria-label="Dismiss message" (click)="clearMessages()">×</button>
+    </div>
+  }
+
+  @if (loading()) {
+    <main class="loading-state"><span class="spinner"></span><p>Preparing your workspace…</p></main>
+  } @else if (!user()) {
+    <main class="login-layout">
+      <section class="login-copy">
+        <p class="eyebrow">PERSONALIZED OUTREACH, MADE THOUGHTFUL</p>
+        <h1>Make every introduction<br /><em>feel personal.</em></h1>
+        <p class="intro">Organize your templates, prepare tailored messages, and send in small, reviewable batches.</p>
+        <div class="login-points">
+          <span><b>01</b> Review every recipient</span>
+          <span><b>02</b> Keep sending under your control</span>
+          <span><b>03</b> Track every campaign</span>
+        </div>
+      </section>
+      <section class="login-card">
+        <div class="login-icon">R</div>
+        <p class="eyebrow">WELCOME TO REACHFLOW</p>
+        <h2>Sign in to your workspace</h2>
+        @if (inviteToken) {
+          <p class="invite-note">Invitation detected. Sign in with the invited Google account to continue.</p>
+        }
+        <button class="primary-button wide-button" (click)="signIn()" [disabled]="busy()">
+          {{ isMock ? 'Continue with demo account' : 'Continue with Google' }}
+        </button>
+        <p class="fine-print">
+          @if (isMock) {
+            Demo data stays in this browser. No Google account or email access is used.
+          } @else {
+            Sign in with your Google account. Gmail access is requested separately and only when you connect a sender.
+          }
+        </p>
+      </section>
+    </main>
+  } @else {
+    <main class="workspace">
+      @if (screen() === 'compose') {
+        <section class="page-heading">
+          <div>
+            <p class="eyebrow">CAMPAIGN WORKSPACE</p>
+            <h1>Compose your outreach</h1>
+            <p class="intro">Start with a role, a job ID and the recipients you want to reach.</p>
+          </div>
+          <span class="step-indicator"><b>01</b> Compose <i>→</i> 02 Review</span>
+        </section>
+
+        <section class="panel campaign-settings">
+          <div class="section-title"><span class="number-badge">1</span><div><h2>Campaign details</h2><p>Set context used to personalize each message.</p></div></div>
+          <div class="form-grid">
+            <label>Campaign name
+              <input [(ngModel)]="campaignName" maxlength="160" placeholder="e.g. Product design referrals" />
+            </label>
+            <label>Template
+              <select [ngModel]="templateId" (ngModelChange)="selectTemplate($event)">
+                <option value="">Current message</option>
+                @for (template of templates(); track template.id) {
+                  <option [value]="template.id">{{ template.template_name }}</option>
+                }
+              </select>
+            </label>
+            <label>Role
+              <input [(ngModel)]="role" maxlength="500" placeholder="e.g. Product Designer" />
+            </label>
+            <label>Job ID
+              <input [(ngModel)]="jobId" maxlength="500" placeholder="e.g. RF-204" />
+            </label>
+          </div>
+        </section>
+
+        <section class="panel recipient-panel">
+          <div class="section-title">
+            <span class="number-badge">2</span>
+            <div><h2>Recipients <span class="count-badge">{{ pendingCount }}</span></h2><p>Paste a list or add one email address at a time.</p></div>
+          </div>
+          <label class="sr-only" for="recipient-list">Recipient email addresses</label>
+          <textarea id="recipient-list" class="recipient-entry" [(ngModel)]="recipientInput" placeholder="alex@example.com&#10;sam@company.com" rows="3"></textarea>
+          <div class="entry-actions">
+            <p>Separate addresses with commas, semicolons or new lines.</p>
+            <button class="secondary-button" (click)="addRecipients()">Add recipients</button>
+          </div>
+
+          @if (recipients().length) {
+            <div class="recipient-list">
+              @for (recipient of recipients(); track recipient.key; let index = $index) {
+                <article class="recipient-card">
+                  <div class="recipient-card-head">
+                    <span class="recipient-index">{{ (index + 1).toString().padStart(2, '0') }}</span>
+                    <label class="recipient-email">Email address
+                      <input [ngModel]="recipient.email" (ngModelChange)="setRecipientEmail(recipient.key, $event)" [class.invalid-field]="!recipient.valid || recipient.duplicate" />
+                    </label>
+                    @if (recipient.duplicate) {
+                      <span class="badge badge-error">Duplicate</span>
+                    } @else if (!recipient.valid) {
+                      <span class="badge badge-error">Invalid</span>
+                    } @else if (recipient.confidence === 'LOW') {
+                      <span class="badge badge-warning">Needs review</span>
+                    } @else {
+                      <span class="badge badge-good">High confidence</span>
+                    }
+                    <button class="icon-button remove-button" aria-label="Remove recipient" (click)="removeRecipient(recipient.key)">×</button>
+                  </div>
+                  @if (recipient.warnings.length) {
+                    <p class="warning-copy">{{ recipient.warnings.join(' · ') }}. Confirm the detected information below.</p>
+                  }
+                  <div class="recipient-fields">
+                    <label>First name
+                      <input [ngModel]="recipient.firstName" (ngModelChange)="updateRecipient(recipient.key, { firstName: $event })" placeholder="First name" />
+                    </label>
+                    <label>Company
+                      <input [ngModel]="recipient.company" (ngModelChange)="updateRecipient(recipient.key, { company: $event })" placeholder="Company" />
+                    </label>
+                    <label class="custom-toggle">
+                      <input type="checkbox" [ngModel]="recipient.useCustomSubject" (ngModelChange)="updateRecipient(recipient.key, { useCustomSubject: $event })" />
+                      <span>Use custom subject</span>
+                    </label>
+                    @if (recipient.useCustomSubject) {
+                      <label class="custom-subject">Custom subject
+                        <input [ngModel]="recipient.customSubject" (ngModelChange)="updateRecipient(recipient.key, { customSubject: $event })" placeholder="Write a recipient-specific subject" />
+                      </label>
+                    }
+                  </div>
+                  <div class="message-editor">
+                    <div class="editor-heading">
+                      <strong>Personalized message</strong>
+                      <div>
+                        <button class="text-button" (click)="importDefaultBody(recipient)">Import default body</button>
+                        <button class="text-button" (click)="resetGeneratedBody(recipient)">Reset to generated</button>
+                      </div>
+                    </div>
+                    <textarea
+                      rows="6"
+                      [ngModel]="recipient.body"
+                      (ngModelChange)="updateRecipient(recipient.key, { body: $event, bodyEdited: true })"
+                      placeholder="Import the default body, then personalize it before sending."
+                    ></textarea>
+                    @if (!isRecipientReady(recipient)) {
+                      <p class="inline-error">{{ recipientErrors(recipient).join(' · ') }}</p>
+                    }
+                  </div>
+                </article>
+              }
+            </div>
+          } @else {
+            <div class="empty-inline"><span class="empty-icon">✳</span><strong>Your recipient list is empty</strong><p>Add an email address to preview personalized details.</p></div>
+          }
+        </section>
+
+        <section class="panel resume-panel">
+          <div class="section-title"><span class="number-badge">3</span><div><h2>Resume attachment <span class="optional-label">Optional</span></h2><p>PDF only, up to 1.5 MB. It is held in memory and never stored by ReachFlow.</p></div></div>
+          @if (attachment(); as resume) {
+            <div class="file-card">
+              <span class="file-icon">PDF</span>
+              <div><strong>{{ resume.filename }}</strong><span>application/pdf · {{ (resume.base64.length * 0.75 / 1024 / 1024).toFixed(2) }} MB</span></div>
+              <button class="text-button" (click)="removeResume()">Remove</button>
+            </div>
+          } @else {
+            <label class="file-picker">
+              <input type="file" accept="application/pdf,.pdf" (change)="selectResume($event)" />
+              <span class="upload-mark">↑</span><strong>Choose a PDF</strong><span>PDF attachment · 1.5 MB maximum</span>
+            </label>
+          }
+        </section>
+
+        <div class="bottom-actions">
+          <button class="text-button" (click)="navigate('templates')">Edit email template</button>
+          <button class="primary-button" (click)="proceedToReview()">Review {{ recipients().length }} recipient{{ recipients().length === 1 ? '' : 's' }} <span>→</span></button>
+        </div>
+      }
+
+      @if (screen() === 'review') {
+        <section class="page-heading">
+          <div><p class="eyebrow">FINAL CHECK</p><h1>Review & send</h1><p class="intro">Review each message before the client-driven batch run begins.</p></div>
+          <span class="step-indicator"><b>02</b> Review <i>←</i> 01 Compose</span>
+        </section>
+        <section class="panel review-overview">
+          <div class="review-stats">
+            <div><span class="stat-label">SENDING FROM</span><strong>{{ senderAddress }}</strong></div>
+            <div><span class="stat-label">RECIPIENTS</span><strong>{{ recipients().length }} messages</strong></div>
+            <div><span class="stat-label">DELIVERY</span><strong>{{ isMock ? 'Simulated batches of 5' : 'Batches of up to 8' }}</strong></div>
+          </div>
+          @if (attachment(); as resume) {
+            <div class="attachment-summary"><span class="file-icon">PDF</span><span>{{ resume.filename }}</span><span>Attached to each message</span></div>
+          }
+        </section>
+        <section class="review-list">
+          @for (recipient of recipients(); track recipient.key; let index = $index) {
+            <article class="panel preview-card">
+              <div class="preview-heading">
+                <div><span class="recipient-index">{{ (index + 1).toString().padStart(2, '0') }}</span><strong>{{ recipient.firstName || 'Recipient' }} {{ recipient.company ? '· ' + recipient.company : '' }}</strong></div>
+                <span class="badge badge-good">{{ recipient.email }}</span>
+              </div>
+              <p class="preview-subject"><span>Subject</span>{{ recipientPreviewSubject(recipient) }}</p>
+              <pre class="preview-body">{{ recipient.body }}</pre>
+              <p class="preview-to">To: {{ recipient.email }}</p>
+            </article>
+          }
+        </section>
+        @if (sending()) {
+          <section class="panel send-progress" aria-live="polite">
+            <div class="progress-label"><strong>Sending campaign</strong><span>{{ sendProgress() }} of {{ sendTotal() }} processed</span></div>
+            <div class="progress-track"><span [style.width.%]="sendTotal() ? sendProgress() * 100 / sendTotal() : 0"></span></div>
+            <button class="secondary-button" (click)="requestCancel()">Cancel after this batch</button>
+          </section>
+        }
+        <div class="bottom-actions">
+          <button class="secondary-button" (click)="navigate('compose')" [disabled]="sending()">Back to edit</button>
+          <button class="primary-button" (click)="startSending()" [disabled]="sending() || !recipients().length">
+            {{ sending() ? 'Sending…' : (isMock ? 'Run mock campaign' : 'Confirm and send') }}
+          </button>
+        </div>
+      }
+
+      @if (screen() === 'templates') {
+        <section class="page-heading">
+          <div><p class="eyebrow">REUSABLE MESSAGES</p><h1>Email templates</h1><p class="intro">Keep a plain-text default and personalize it for each recipient before sending.</p></div>
+          <button class="secondary-button" (click)="loadSampleTemplate()">Load sample</button>
+        </section>
+        <section class="template-layout">
+          <aside class="panel template-sidebar">
+            <div class="sidebar-title"><h2>Your templates</h2><button class="icon-button" aria-label="Create a new template" (click)="loadSampleTemplate()">+</button></div>
+            @for (template of templates(); track template.id) {
+              <button class="template-choice" [class.selected]="templateId === template.id" (click)="selectTemplate(template.id)">
+                <strong>{{ template.template_name }}</strong><span>{{ template.default_subject }}</span>
+              </button>
+            } @empty {
+              <p class="muted-copy">No saved templates yet.</p>
+            }
+          </aside>
+          <section class="panel template-editor">
+            <div class="section-title"><span class="number-badge">✎</span><div><h2>Edit template</h2><p>Use [Name], [Company], [Role] and [JobId] to personalize messages.</p></div></div>
+            <label>Template name<input [(ngModel)]="templateName" maxlength="120" /></label>
+            <label>Default subject<input [(ngModel)]="defaultSubject" maxlength="998" /></label>
+            <label>Default body<textarea rows="12" [(ngModel)]="defaultBody" maxlength="100000"></textarea></label>
+            <div class="template-actions">
+              @if (templateId) { <button class="text-button danger-text" (click)="deleteCurrentTemplate()">Delete</button> }
+              <button class="primary-button" (click)="saveTemplate()" [disabled]="busy()">Save template</button>
+            </div>
+          </section>
+        </section>
+      }
+
+      @if (screen() === 'history') {
+        <section class="page-heading">
+          <div><p class="eyebrow">YOUR OUTREACH</p><h1>Campaign history</h1><p class="intro">Follow each recipient's delivery status. Sent messages are never retried.</p></div>
+          <button class="primary-button" (click)="navigate('compose')">New campaign <span>→</span></button>
+        </section>
+        @if (history().length) {
+          <section class="history-layout">
+            <div class="panel history-list">
+              @for (campaign of history(); track campaign.id) {
+                <button class="history-item" [class.selected]="selectedCampaign()?.id === campaign.id" (click)="openCampaign(campaign.id)">
+                  <div><strong>{{ campaign.campaign_name }}</strong><span>{{ prettyDate(campaign.created_at) }}</span></div>
+                  <div class="history-item-meta"><span class="status-tag" [class]="'status-tag status-' + campaign.status.toLowerCase()">{{ campaign.status }}</span><span>{{ campaign.sent_count }}/{{ campaign.total_recipients }} sent</span></div>
+                </button>
+              }
+            </div>
+            <section class="panel history-detail">
+              @if (selectedCampaign(); as campaign) {
+                <div class="detail-heading">
+                  <div><p class="eyebrow">CAMPAIGN DETAIL</p><h2>{{ campaign.campaign_name }}</h2><p>{{ campaign.total_recipients }} recipients · {{ campaign.sent_count }} sent · {{ campaign.failed_count }} failed</p></div>
+                  <div class="detail-actions">
+                    @if (campaign.failed_count) { <button class="secondary-button" (click)="retryFailed()" [disabled]="sending()">Retry failed</button> }
+                    @if (campaign.status === 'SENDING') { <button class="text-button danger-text" (click)="cancelSelectedCampaign()">Cancel pending</button> }
+                  </div>
+                </div>
+                @if (campaign.recipients?.length) {
+                  <div class="recipient-status-list">
+                    @for (recipient of campaign.recipients ?? []; track recipient.id) {
+                      <article class="status-recipient">
+                        <div class="status-recipient-main"><strong>{{ recipient.recipient_name || recipient.recipient_email }}</strong><span>{{ recipient.recipient_email }}</span></div>
+                        <span class="status-tag" [class]="'status-tag status-' + recipient.sending_status.toLowerCase()">{{ recipient.sending_status }}</span>
+                        @if (recipient.error_message) { <p class="delivery-error">{{ recipient.error_message }}</p> }
+                      </article>
+                    }
+                  </div>
+                } @else {
+                  <p class="muted-copy">Select a campaign to inspect recipient statuses.</p>
+                }
+                @if (campaign.failed_count) {
+                  <div class="retry-attachment">
+                    <label class="file-picker compact-picker">
+                      <input type="file" accept="application/pdf,.pdf" (change)="selectResume($event)" />
+                      <strong>{{ attachment()?.filename ?? 'Attach the PDF again for retries (optional)' }}</strong>
+                      <span>Resume files are not retained after the original request.</span>
+                    </label>
+                  </div>
+                }
+              } @else {
+                <div class="empty-inline"><span class="empty-icon">◷</span><strong>Select a campaign</strong><p>Recipient details and delivery outcomes will appear here.</p></div>
+              }
+            </section>
+          </section>
+        } @else {
+          <section class="panel empty-state"><span class="empty-icon">◷</span><h2>No campaigns yet</h2><p>Your campaigns and per-recipient delivery statuses will appear here.</p><button class="primary-button" (click)="navigate('compose')">Compose your first campaign</button></section>
+        }
+      }
+
+      @if (screen() === 'admin') {
+        <section class="page-heading">
+          <div><p class="eyebrow">WORKSPACE CONTROLS</p><h1>Administration</h1><p class="intro">Manage registration, invitations and user access.</p></div>
+          <span class="admin-label">ADMIN ACCESS</span>
+        </section>
+        @if (adminData(); as admin) {
+          <section class="admin-stats">
+            <div class="panel stat-card"><span>USERS</span><strong>{{ admin.counts.users }}</strong></div>
+            <div class="panel stat-card"><span>CAMPAIGNS</span><strong>{{ admin.counts.campaigns }}</strong></div>
+            <div class="panel stat-card"><span>INVITATIONS</span><strong>{{ admin.counts.invitations }}</strong></div>
+          </section>
+          <section class="panel admin-panel">
+            <div class="section-title"><span class="number-badge">01</span><div><h2>Registration mode</h2><p>Choose who can create a workspace account.</p></div></div>
+            <div class="registration-options">
+              <button [class.selected]="admin.registrationMode === 'INVITE_ONLY'" (click)="setRegistrationMode('INVITE_ONLY')"><strong>Invite only</strong><span>New users need a single-use invitation.</span></button>
+              <button [class.selected]="admin.registrationMode === 'PUBLIC'" (click)="setRegistrationMode('PUBLIC')"><strong>Public registration</strong><span>Anyone with a verified Google email can join.</span></button>
+            </div>
+          </section>
+          <section class="panel admin-panel">
+            <div class="section-title"><span class="number-badge">02</span><div><h2>Invite a teammate</h2><p>Invitation links expire after seven days and can only be used once.</p></div></div>
+            <form class="invite-form" (ngSubmit)="createInvitation()">
+              <label>Email address<input name="inviteEmail" type="email" required [(ngModel)]="inviteEmail" placeholder="teammate@example.com" /></label>
+              <button class="primary-button" type="submit" [disabled]="!inviteEmail.trim()">Create invitation</button>
+            </form>
+            @if (newInvitation()) {
+              <div class="invite-link-card"><div><strong>Invitation link — shown once</strong><input readonly [value]="newInvitation()" aria-label="New invitation link" /></div><button class="secondary-button" (click)="copyInvitation()">Copy link</button></div>
+            }
+          </section>
+          <section class="panel admin-panel">
+            <div class="section-title"><span class="number-badge">03</span><div><h2>Workspace users</h2><p>Disabled users lose access immediately, including active sessions.</p></div></div>
+            <div class="admin-table">
+              <div class="admin-table-head"><span>USER</span><span>ROLE</span><span>STATUS</span><span>ACCESS</span></div>
+              @for (member of admin.users; track member.id) {
+                <div class="admin-table-row"><div><strong>{{ member.name }}</strong><span>{{ member.email }}</span></div><span>{{ member.role }}</span><span class="status-tag" [class]="'status-tag status-' + member.status.toLowerCase()">{{ member.status }}</span><button class="text-button" (click)="toggleUser(member)" [disabled]="member.id === user()?.id">{{ member.status === 'ACTIVE' ? 'Disable' : 'Enable' }}</button></div>
+              } @empty {
+                <p class="muted-copy">No users found.</p>
+              }
+            </div>
+          </section>
+        }
+      }
+    </main>
+  }
+
+  @if (!loading()) {
+    <footer class="app-footer"><span>REACHFLOW</span><span>Made for meaningful connections.</span><span>Angular · Cloudflare Workers</span></footer>
+  }
+</div>

@@ -1,20 +1,30 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "reachflow-api",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-11-19",
-  "migrations_dir": "migrations",
-  "assets": {
-    "directory": "../frontend/dist/frontend/browser",
-    "binding": "ASSETS",
-    "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
-  },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "reachflow-local",
-      "database_id": "00000000-0000-0000-0000-000000000001"
-    }
-  ]
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "reachflow-api",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-19",
+	"workers_dev": true,
+	"preview_urls": false,
+	"assets": {
+		"directory": "../frontend/dist/frontend/browser",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "reachflow",
+			"database_id": "2c6150b5-6887-4038-8623-db292ce41929",
+			"migrations_dir": "migrations"
+		}
+	],
+	"vars": {
+		"EMAIL_MODE": "GMAIL",
+		"ADMIN_EMAILS": "dubeysomil48@gmail.com",
+		"DAILY_SEND_LIMIT": "20",
+		"APP_BASE_URL": "https://reachflow-api.dubeysomil48.workers.dev"
+	}
 }
